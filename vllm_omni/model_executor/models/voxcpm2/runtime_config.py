@@ -23,6 +23,8 @@ class _VoxCPM2RuntimeConfig:
     enable_loc_dit_skip_qkv_contig: bool = True
     enable_loc_dit_reduce_overhead_no_cg: bool = False
     enable_loc_dit_fullgraph_no_cg: bool = False
+    inference_timesteps: int = 10
+    cfg_value: float = 2.0
     cfg_cutoff_ratio: float = 1.0
     decode_graph_capture_policy: str = "all"
     enable_vae_cuda_graph: bool = False
@@ -115,6 +117,7 @@ class _VoxCPM2RuntimeConfig:
             if key == "unified_decode_graph_prefill_interval":
                 return max(0, value)
             if key in {
+                "inference_timesteps",
                 "audio_emit_every",
                 "vae_decode_every",
                 "batched_fsq_fusion_max_batch",
