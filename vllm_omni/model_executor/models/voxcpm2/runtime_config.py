@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import Any
 
 from vllm.logger import init_logger
@@ -113,15 +114,14 @@ class _VoxCPM2RuntimeConfig:
             return bool(value)
         if isinstance(default, int) and not isinstance(default, bool):
             value = int(value)
-            if key in {
-                "inference_timesteps",
-                "audio_emit_every",
-                "vae_decode_every",
-                "batched_fsq_fusion_max_batch",
-            }:
+            if key == "inference_timesteps":
+                return max(2, value)
+            if key in {"audio_emit_every", "vae_decode_every", "batched_fsq_fusion_max_batch"}:
                 return max(1, value)
             return value
         if isinstance(default, float):
+            if key == "cfg_value" and not math.isfinite(float(value)):
+                raise ValueError("VoxCPM2 cfg_value must be finite.")
             if key == "cfg_cutoff_ratio":
                 return min(1.0, max(0.0, float(value)))
             return float(value)
