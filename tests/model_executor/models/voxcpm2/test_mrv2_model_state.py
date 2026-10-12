@@ -105,6 +105,25 @@ def test_slots_allocate_up_front_and_reuse_without_cross_request_state(monkeypat
         state.add_request(0, SimpleNamespace(req_id="third"))
 
 
+def test_incremental_vae_feature_cache_follows_preempted_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = _talker(torch.device("cpu"))
+    state = _state(model, 2, torch.device("cpu"), monkeypatch)
+    state.incremental_vae = True  # Exercise lifecycle on CPU, without enabling CUDA execution.
+    state.vae_feature_cache = {"conv": torch.ones(3, 2, 6)}
+    state.add_request(0, SimpleNamespace(req_id="first"))
+    assert not state.vae_feature_cache["conv"][0].any()
+    state.vae_feature_cache["conv"][0].fill_(7)
+    state.on_request_preempted("first", 0)
+    state.remove_request(0)
+    assert not state.vae_feature_cache["conv"][0].any()
+    state.add_request(0, SimpleNamespace(req_id="second"))
+    state.vae_feature_cache["conv"][0].fill_(3)
+    state.add_request(1, SimpleNamespace(req_id="first"))
+    torch.testing.assert_close(state.vae_feature_cache["conv"][1], torch.full((2, 6), 7.0))
+    torch.testing.assert_close(state.vae_feature_cache["conv"][0], torch.full((2, 6), 3.0))
+    assert "first" not in state.suspended_vae_features
+
+
 def test_pending_batch_preserves_reordered_slots_and_individual_counts(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _talker(torch.device("cpu"))
     model._vae_decode_every = 3
@@ -911,3 +930,60 @@ def test_mrv2_output_does_not_copy_audio_to_host(monkeypatch: pytest.MonkeyPatch
     output = model.make_omni_output(torch.zeros(1, 4, device=device), request_ids=["first"])
     assert state.audio_buffer.device.type == "cuda"
     assert output.multimodal_outputs["voxcpm2_audio_pending"] is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("emit_every", [1, 3])
+def test_per_patch_logits_use_gpu_active_and_preserve_stop_scores(monkeypatch, emit_every):
+    model = _talker(torch.device("cuda"))
+    model.config.vocab_size = 5
+    model._audio_emit_every = emit_every
+    state = _state(model, 3, torch.device("cuda"), monkeypatch)
+    for slot, values in enumerate(([0.9, 0.1], [0.4, 0.1], [0.2, 0.8])):
+        state.add_request(slot, SimpleNamespace(req_id=f"req-{slot}"))
+        state.store_decode_state(
+            state.slots[slot],
+            torch.tensor([values], device="cuda"),
+            torch.zeros(6, device="cuda"),
+            torch.zeros(4, 2, device="cuda"),
+        )
+    state.per_patch_audio = True
+    state.graph_active = torch.tensor([False, True, True, False], device="cuda")
+    model._results_queue = [
+        (state.slots[slot], state.tensor_for(state.slots[slot], "precomputed_stop_logits")) for slot in (2, 0, 1)
+    ]
+    logits = model.compute_logits(torch.zeros(3, 6, device="cuda"))
+    expected = [[0.0, 1.0] if emit_every > 1 else [0.2, 0.8], [0.0, 1.0], [0.4, 0.1]]
+    torch.testing.assert_close(logits[:, :2], torch.tensor(expected, device="cuda"))
+    assert torch.isneginf(logits[:, 2:]).all()
+    assert all(not owner.is_stopping for owner in state.slots)  # No CPU stop-mask materialization.
+
+
+def test_per_patch_preemption_restores_context_and_pending_api_audio(monkeypatch):
+    from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
+
+    model = _talker(torch.device("cpu"))
+    state = _state(model, 2, torch.device("cpu"), monkeypatch)
+    # Exercise lifecycle on CPU; production enables this state only on CUDA.
+    state.per_patch_audio = True
+    state.graph_active = torch.zeros(3, dtype=torch.bool)
+    state.graph_context = torch.zeros(3, 12, 2)
+    state.graph_context_lengths = torch.zeros(3, dtype=torch.long)
+    state.suspended_graph = {}
+    state.pcm_stream = StreamingAudioBuffer(32, 2)
+    state.add_request(0, SimpleNamespace(req_id="first"))
+    state.graph_context[0, :4].fill_(7)
+    state.graph_context_lengths[0] = 4
+    audio = state.pcm_stream.add("first")
+    audio.emitted = True
+    assert audio.push(torch.ones(32), ended=False) is None
+    state.on_request_preempted("first", 0)
+    state.remove_request(0)
+    state.add_request(0, SimpleNamespace(req_id="other"))
+    state.graph_context[0].fill_(9)
+    state.add_request(1, SimpleNamespace(req_id="first"))
+    assert state.graph_active.tolist() == [True, True, False]
+    assert state.graph_context_lengths[1] == 4
+    assert state.graph_context[1, :4].tolist() == [[7.0, 7.0]] * 4
+    assert state.pcm_stream.requests["first"] is audio
+    assert audio.push(torch.full((32,), 2.0), ended=False).tolist() == [1.0] * 32 + [2.0] * 32

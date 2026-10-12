@@ -30,6 +30,7 @@ class _VoxCPM2RuntimeConfig:
     cfg_cutoff_ratio: float = 1.0
     decode_graph_capture_policy: str = "all"
     enable_vae_cuda_graph: bool = False
+    enable_incremental_vae: bool = False
     enable_cfm_cuda_graph: bool = False
     enable_cfm_prealloc_output: bool = False
     enable_batched_cfm: bool = True
@@ -87,6 +88,10 @@ class _VoxCPM2RuntimeConfig:
         if cfg.delayed_audio_copy_use_events and not cfg.enable_delayed_audio_copy:
             logger.warning("VoxCPM2 delayed audio copy events require delayed audio copy; disabling event polling.")
             cfg = dataclasses.replace(cfg, delayed_audio_copy_use_events=False)
+        if cfg.enable_incremental_vae and cfg.enable_batched_vae_decode:
+            # Incremental unified graphs batch VAE themselves; this flag only
+            # controls the legacy latent-cohort collection path.
+            cfg = dataclasses.replace(cfg, enable_batched_vae_decode=False)
         if cfg.enable_batched_vae_decode and (
             cfg.enable_delayed_audio_copy or cfg.audio_emit_every > 1 or cfg.enable_vae_cuda_graph
         ):

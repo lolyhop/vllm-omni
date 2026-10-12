@@ -1,0 +1,14 @@
+# MRV2 mixed/unified graphs with incremental per-patch VAE decoding.
+base_config: voxcpm2.yaml
+model_runner: v2
+stages:
+  - stage_id: 0
+    enable_chunked_prefill: false
+    engine_extras:
+      hf_overrides:
+        voxcpm2_runtime_config:
+          vae_decode_every: 1
+          audio_emit_every: 3
+          enable_unified_decode_graph: true
+          enable_incremental_vae: true
+          enable_batched_vae_decode: false

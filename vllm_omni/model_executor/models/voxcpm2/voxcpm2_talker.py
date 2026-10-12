@@ -395,6 +395,12 @@ class _CapturedUnifiedDecodeGraph:
     text_mask: torch.Tensor | None = None
     last_token_indices: torch.Tensor | None = None
     scaffold_hidden: torch.Tensor | None = None
+    pcm: torch.Tensor | None = None
+    pcm_valid: torch.Tensor | None = None
+    stop_logits: torch.Tensor | None = None
+    audio_slots: torch.Tensor | None = None
+    audio_rows_valid: torch.Tensor | None = None
+    audio_copy_event: torch.cuda.Event | None = None
 
 
 @dataclasses.dataclass
@@ -1040,6 +1046,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._batched_fsq_fusion_max_batch = self._runtime_config.batched_fsq_fusion_max_batch
         self._audio_copy_stream: torch.cuda.Stream | None = None
         self._max_cached_graphs = self._max_batch_size
+        self._max_cached_mixed_graphs = 32
         self._cuda_graph_warmup_steps = 0
         self._cuda_graph_warmup_threshold = 3
         self._unified_graphs: dict[int, _CapturedUnifiedDecodeGraph] = {}
@@ -1490,7 +1497,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             self._raise_if_cuda_runtime_error(e)
             logger.warning("torch.compile feat_encoder failed: %s", e)
 
-        if self._compile_vae and not self._enable_vae_cuda_graph:
+        if self._compile_vae and not self._enable_vae_cuda_graph and not self._runtime_config.enable_incremental_vae:
             try:
                 if not hasattr(tts.audio_vae, "_compiled"):
                     tts.audio_vae.decode = torch.compile(tts.audio_vae.decode, mode="reduce-overhead", fullgraph=False)
@@ -1895,6 +1902,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         if mixed:
             g.text_mask = torch.ones(token_capacity, 1, device=dev, dtype=dtype)
             g.last_token_indices = torch.zeros(batch_size, device=dev, dtype=torch.long)
+        model_state = getattr(self, "_mrv2_model_state", None)
+        per_patch_audio = model_state is not None and model_state.per_patch_audio
+        if per_patch_audio:
+            g.audio_slots = torch.full((batch_size,), len(model_state.slots), device=dev, dtype=torch.long)
+            g.audio_rows_valid = torch.zeros(batch_size, device=dev, dtype=torch.bool)
         dit_proj = self._dit_proj_fn
 
         def unified_fwd():
@@ -1925,6 +1937,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             )
             feat_enc = tts.feat_encoder(cfm_out.transpose(1, 2).unsqueeze(1)).squeeze(1)
             next_embed = tts.enc_to_lm_proj(feat_enc)
+            if per_patch_audio:
+                g.stop_logits = self._stop_fn(lm_h)
+                if getattr(model_state, "incremental_vae", False):
+                    g.pcm, g.pcm_valid = model_state.decode_patch_in_graph(
+                        g.audio_slots, g.audio_rows_valid, cfm_out.transpose(1, 2)
+                    )
+                    model_state.commit_patch_in_graph(
+                        g.audio_slots, g.pcm_valid, next_embed, cfm_out.transpose(1, 2), g.stop_logits
+                    )
             return next_embed, cfm_out, lm_h
 
         ctx = get_forward_context()
@@ -2019,6 +2040,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         batch_context: VoxCPM2BatchSlots | None = None,
         mixed_token_capacity: int | None = None,
     ) -> torch.Tensor:
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None and model_state.per_patch_audio and model_state._pcm_copy_event is not None:
+            # The shared capture pool can alias outputs across different buckets.
+            torch.cuda.current_stream(self._device).wait_event(model_state._pcm_copy_event)
         graph_size = self._select_unified_graph_bucket_size(num_reqs)
         if graph_size is None:
             raise RuntimeError(f"No unified decode graph bucket for batch size {num_reqs}")
@@ -2095,14 +2120,35 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 g.cfm_noise[i : i + 1].normal_(generator=state.cfm_generator)
         self._perf.stop("unified.copy_inputs")
 
+        if g.audio_slots is not None:
+            g.audio_slots[:num_reqs].copy_(slot_indices)
+            g.audio_slots[num_reqs:].fill_(len(model_state.slots))
+            host = torch.tensor(
+                commit_patch_mask + [False] * (graph_size - num_reqs), dtype=torch.bool, pin_memory=True
+            )
+            g.audio_rows_valid.copy_(host, non_blocking=True)
         self._perf.start("unified.replay")
         g.graph.replay()
         self._perf.stop("unified.replay")
 
+        if g.audio_slots is not None and not getattr(model_state, "incremental_vae", False):
+            with torch.no_grad():
+                patch = g.cfm_output.transpose(1, 2)
+                g.pcm, g.pcm_valid = model_state.decode_patch_in_graph(g.audio_slots, g.audio_rows_valid, patch)
+                model_state.commit_patch_in_graph(g.audio_slots, g.pcm_valid, g.next_feat_embed, patch, g.stop_logits)
+
         self._perf.start("unified.commit")
         with torch.no_grad():
-            all_stop_logits = self._stop_fn(g.lm_hidden[:num_reqs])
-        if model_state is not None:
+            all_stop_logits = (
+                g.stop_logits[:num_reqs] if g.stop_logits is not None else self._stop_fn(g.lm_hidden[:num_reqs])
+            )
+        if model_state is not None and g.pcm is not None:
+            # Tensor commits run on GPU; request control flags stay on host.
+            for state in states:
+                state.decode_state_ready = True
+                state.stop_logits_ready = True
+                state.precomputed_is_stopping = None
+        elif model_state is not None:
             # store_decode_batch writes committed rows. Only stopping rows
             # need their logits refreshed separately.
             if not all(commit_patch_mask):
@@ -2155,6 +2201,18 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     state.prefill_embeds = None
                     state.prefill_masks = None
                     state.prompt_cache = None
+        if g.pcm is not None:
+            # The output copy stream records this event before another replay.
+            g.audio_copy_event = torch.cuda.Event()
+            model_state._pcm_copy_event = g.audio_copy_event
+            model_state._step_pcm = (g.pcm[:num_reqs], g.pcm_valid[:num_reqs], g.audio_copy_event)
+            for state in states:
+                state.audio_patch_ready = False
+                self._results_queue.append((state, self._state_tensor(state, "precomputed_stop_logits")))
+                self._audio_queue.append((state, None))
+            self._pending_requests.clear()
+            self._flush_deferred_cleanup()
+            return g.scaffold_hidden[:num_tokens] if mixed_token_capacity is not None else g.next_feat_embed[:num_reqs]
         self._perf.start("unified.audio")
         self._precompute_stop_flags_for_audio_collect(states)
         ready_audio = self._drain_ready_audio_copies_for_states(states)
@@ -2245,12 +2303,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             tokens = self._mixed_token_capacity(sum(int(n) for n in num_scheduled_tokens), bucket)
             if tokens is None:
                 return None
-            if (bucket, tokens) not in self._mixed_graphs and len(self._mixed_graphs) >= self._max_cached_graphs:
+            if (bucket, tokens) not in self._mixed_graphs and len(self._mixed_graphs) >= self._max_cached_mixed_graphs:
                 return None
             return RunnerAssistedFullAttentionMetadataRequest(
                 bucket, (bucket, tokens) not in self._mixed_graphs, tokens
             )
-        if num_reqs <= 1 or num_reqs > self._unified_decode_graph_max_batch_size:
+        model_state = getattr(self, "_mrv2_model_state", None)
+        per_patch_single = num_reqs == 1 and getattr(model_state, "per_patch_audio", False)
+        if (num_reqs <= 1 and not per_patch_single) or num_reqs > self._unified_decode_graph_max_batch_size:
             return None
         if num_reqs > self._max_cached_graphs or self._select_unified_graph_bucket_size(num_reqs) is None:
             return None
@@ -3126,6 +3186,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         return torch.cat([chunk.reshape(-1) for chunk in chunks], dim=0)
 
     def _precompute_stop_flags_for_audio_collect(self, states: list[_RequestState]) -> None:
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None and model_state.per_patch_audio:
+            return
         if (
             self._audio_emit_every == 1
             and not self._enable_delayed_audio_copy
@@ -3214,6 +3277,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         # patch shape: (patch_size, feat_dim) or (1, patch_size, feat_dim)
         new_latent = patch.reshape(-1, self._feat_dim).to(torch.float32)
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None and model_state.per_patch_audio:
+            indices = model_state.indices_for([state])
+            pcm, valid = model_state.decode_patch_in_graph(
+                indices, torch.ones(1, dtype=torch.bool, device=indices.device), new_latent.unsqueeze(0)
+            )
+            model_state.record_eager_pcm(state, pcm[0], valid[0])
+            return None
         vae_decode_every = getattr(self, "_vae_decode_every", 1)
         if vae_decode_every > 1:
             is_stopping = self._should_stop_from_cached_logits(state)
@@ -3305,6 +3376,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         states: list[_RequestState],
         initial_delayed_chunks_by_req: dict[int | str, list[torch.Tensor] | None] | None,
     ) -> bool:
+        model_state = getattr(self, "_mrv2_model_state", None)
+        if model_state is not None and model_state.per_patch_audio:
+            return False  # Graph path owns VAE; warmup falls back per request.
         if not getattr(self, "_enable_batched_vae_decode", False):
             return False
         if self._enable_delayed_audio_copy or self._audio_emit_every > 1 or self._enable_vae_cuda_graph:
@@ -3548,7 +3622,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     def preprocess_batch_mrv2(self, *, req_infos: list[dict[str, Any]], device: torch.device) -> None:
         """Batch new V2 prefill embeddings after per-request audio encoding."""
-        candidates: list[tuple[dict[str, Any], torch.Tensor]] = []
+        candidates: list[tuple[dict[str, Any], list[int]]] = []
         split_map = self._get_multichar_zh_split()
         for info in req_infos:
             extra = info.get("additional_information")
@@ -3574,11 +3648,16 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             if token_ids[0] == self.config.bos_token_id:
                 token_ids = token_ids[1:]
             token_ids.append(self.tts.audio_start_token)
-            candidates.append((info, torch.tensor(token_ids, device=device, dtype=torch.long)))
+            candidates.append((info, token_ids))
 
         if len(candidates) >= 2:
-            lengths = [tokens.numel() for _, tokens in candidates]
-            embedded = self.model.embed_input_ids(torch.cat([tokens for _, tokens in candidates]))
+            lengths = [len(tokens) for _, tokens in candidates]
+            host_tokens = torch.tensor(
+                [token for _, tokens in candidates for token in tokens],
+                dtype=torch.long,
+                pin_memory=device.type == "cuda",
+            )
+            embedded = self.model.embed_input_ids(host_tokens.to(device, non_blocking=True))
             for (info, _), text_embed in zip(candidates, embedded.split(lengths), strict=True):
                 info["prefill_text_embed"] = text_embed
 

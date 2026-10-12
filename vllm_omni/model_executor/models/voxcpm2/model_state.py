@@ -12,6 +12,10 @@ import numpy as np
 import torch
 
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
+from vllm_omni.worker_v2.streaming_audio import StreamingAudioBuffer
+
+from .incremental_vae import incremental_vae_decode
+from .per_patch_audio import PerPatchPCMOutput, pack_patch_context
 
 
 @dataclasses.dataclass
@@ -56,6 +60,17 @@ class VoxCPM2ModelState(OmniModelState):
         from .voxcpm2_talker import _RequestState
 
         count = self.scheduler_config.max_num_seqs
+        self.per_patch_audio = (
+            device.type == "cuda"
+            and model._vae_decode_every == 1
+            and getattr(model, "_enable_unified_decode_graph", False)
+        )
+        self.incremental_vae = getattr(getattr(model, "_runtime_config", None), "enable_incremental_vae", False)
+        if self.incremental_vae and not self.per_patch_audio:
+            raise ValueError("Incremental VoxCPM2 VAE requires CUDA MRV2 per-patch unified graphs")
+        self.vae_feature_cache: dict[str, torch.Tensor] = {}
+        self.suspended_vae_features: dict[str, dict[str, torch.Tensor]] = {}
+        tensor_count = count + int(self.per_patch_audio)
         samples_per_patch = model._patch_size * int(model.tts.audio_vae.decode_chunk_size)
         capacity = samples_per_patch * model._vae_decode_every * model._audio_emit_every
         self.slots = [_RequestState(request_id="") for _ in range(count)]
@@ -64,10 +79,12 @@ class VoxCPM2ModelState(OmniModelState):
         self.suspended_audio: dict[str, tuple[torch.Tensor, int]] = {}
         self.slot_indices = torch.empty(count, device=device, dtype=torch.long)
         embed_dim = model.config.hidden_size
-        self.next_embed = torch.empty((count, embed_dim), device=device, dtype=model._side_dtype)
-        self.prefix_feat = torch.empty((count, model._patch_size, model._feat_dim), device=device, dtype=torch.float32)
-        self.stop_logits = torch.empty((count, 2), device=device, dtype=model._side_dtype)
-        self.decode_pad = torch.empty((count, model._n_decode_pad_frames, model._feat_dim), device=device)
+        self.next_embed = torch.empty((tensor_count, embed_dim), device=device, dtype=model._side_dtype)
+        self.prefix_feat = torch.empty(
+            (tensor_count, model._patch_size, model._feat_dim), device=device, dtype=torch.float32
+        )
+        self.stop_logits = torch.empty((tensor_count, 2), device=device, dtype=model._side_dtype)
+        self.decode_pad = torch.empty((tensor_count, model._n_decode_pad_frames, model._feat_dim), device=device)
         self.pending_latents = torch.empty(
             (count, model._vae_decode_every, model._patch_size, model._feat_dim), device=device
         )
@@ -76,6 +93,17 @@ class VoxCPM2ModelState(OmniModelState):
         self.suspended: dict[str, _RequestState] = {}
         # V2 batch slot mapping used while preparing request inputs.
         self.preprocess_batch_slots: VoxCPM2BatchSlots | None = None
+        self._step_pcm = None
+        self._pcm_copy_event: torch.cuda.Event | None = None
+        self._fallback_pcm: dict[int, torch.Tensor] = {}
+        self._fallback_valid: dict[int, torch.Tensor] = {}
+        if self.per_patch_audio:
+            # An extra dummy slot keeps graph padding away from real owners.
+            self.graph_active = torch.zeros(count + 1, device=device, dtype=torch.bool)
+            self.graph_context = self.decode_pad.zero_()
+            self.graph_context_lengths = torch.zeros(count + 1, device=device, dtype=torch.long)
+            self.pcm_stream = StreamingAudioBuffer(samples_per_patch, model._audio_emit_every)
+            self.suspended_graph: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         model._mrv2_model_state = self
 
     def prepare_inputs(self, input_batch: Any, req_states: Any) -> dict[str, Any]:
@@ -126,6 +154,8 @@ class VoxCPM2ModelState(OmniModelState):
             return
         count = input_batch.num_reqs
         slots = input_batch.idx_mapping_np[:count]
+        if self.per_patch_audio:
+            self._length_limits = req_states.max_seq_len
         ends_by_length = self.model._audio_length_limit_reached(
             input_batch.num_computed_tokens_np[:count],
             np.asarray(input_batch.num_scheduled_tokens[:count]),
@@ -179,6 +209,80 @@ class VoxCPM2ModelState(OmniModelState):
         indices = self.indices_for(states, batch_context)
         return self.next_embed.index_select(0, indices)
 
+    def decode_patch_in_graph(self, slots, rows_valid, patch):
+        if getattr(self, "incremental_vae", False):
+            valid = rows_valid & self.graph_active.index_select(0, slots)
+            sr_cond = self.model._get_vae_decode_sr_cond(patch.device)
+            pcm = incremental_vae_decode(
+                self.model.tts.audio_vae,
+                patch.float().transpose(1, 2),
+                self.vae_feature_cache,
+                slots,
+                valid,
+                len(self.slots) + 1,
+                sr_cond,
+            )
+            return pcm.reshape(len(slots), -1), valid
+        lengths = self.graph_context_lengths.index_select(0, slots)
+        context = self.graph_context.index_select(0, slots)
+        inputs, tail, next_lengths = pack_patch_context(context, lengths, patch.float())
+        sr_cond = self.model._get_vae_decode_sr_cond(inputs.device)
+        decoded = self.model.tts.audio_vae.decode(inputs, sr_cond=sr_cond).reshape(len(slots), -1)
+        samples = self.model._patch_size * int(self.model.tts.audio_vae.decode_chunk_size)
+        offsets = lengths[:, None] * int(self.model.tts.audio_vae.decode_chunk_size)
+        pcm = decoded.gather(1, offsets + torch.arange(samples, device=decoded.device)[None, :])
+        valid = rows_valid & self.graph_active.index_select(0, slots)
+        self.graph_context.index_copy_(0, slots, torch.where(valid[:, None, None], tail, context))
+        self.graph_context_lengths.index_copy_(0, slots, torch.where(valid, next_lengths, lengths))
+        return pcm, valid
+
+    def commit_patch_in_graph(self, slots, valid, next_embed, patch, stop_logits):
+        embeds = self.next_embed.index_select(0, slots)
+        features = self.prefix_feat.index_select(0, slots)
+        self.next_embed.index_copy_(0, slots, torch.where(valid[:, None], next_embed.to(embeds.dtype), embeds))
+        self.prefix_feat.index_copy_(0, slots, torch.where(valid[:, None, None], patch.to(features.dtype), features))
+        self.stop_logits.index_copy_(0, slots, stop_logits[:, :2].to(self.stop_logits.dtype))
+
+    def record_eager_pcm(self, state, pcm, valid):
+        slot = self._slot_for(state)
+        self._fallback_pcm[slot] = pcm
+        self._fallback_valid[slot] = valid
+
+    def run_eager_mtp(
+        self, input_batch, text_hidden, sampled_token_ids, multimodal_outputs, mtp_batch_descriptor_dispatcher=None
+    ):
+        super().run_eager_mtp(
+            input_batch, text_hidden, sampled_token_ids, multimodal_outputs, mtp_batch_descriptor_dispatcher
+        )
+        if not self.per_patch_audio:
+            return
+        count = input_batch.num_reqs
+        if not count:
+            self._step_ended = sampled_token_ids.new_empty(0, dtype=torch.bool)
+            return
+        slots = input_batch.idx_mapping[:count].long()
+        rows = input_batch.idx_mapping_np[:count]
+        ended = sampled_token_ids[:count].reshape(count, -1)[:, 0] == 1
+        host_end = self.model._audio_length_limit_reached(
+            input_batch.num_computed_tokens_np[:count],
+            np.asarray(input_batch.num_scheduled_tokens[:count]),
+            self._length_limits[rows],
+        )
+        host_end |= np.asarray([self.slots[int(slot)].is_stopping for slot in rows], dtype=bool)
+        host = torch.from_numpy(host_end).pin_memory()
+        ended |= host.to(ended.device, non_blocking=True)
+        if self.model._audio_emit_every > 1:
+            values = self.stop_logits.index_select(0, slots)
+            ended |= values[:, 1] > values[:, 0]
+        if self._step_pcm is not None:
+            valid = self._step_pcm[1]
+        else:
+            valid = torch.stack([self._fallback_valid.get(int(slot), self.graph_active.new_zeros(())) for slot in rows])
+        # Intermediate prefill rows have no patch or sampled token to consume.
+        ended &= valid
+        self.graph_active.index_copy_(0, slots, self.graph_active.index_select(0, slots) & ~ended)
+        self._step_ended = ended
+
     def build_stop_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """One metadata upload and one kernel, preserving legacy sampling scores."""
         from .logits import write_stop_logits
@@ -211,6 +315,9 @@ class VoxCPM2ModelState(OmniModelState):
                 stop_stride=self.stop_logits.stride(0),
                 vocab_size=logits.shape[1],
                 block=block,
+                active=self.graph_active if self.per_patch_audio else self.stop_logits,
+                use_active=self.per_patch_audio,
+                force_argmax_stop=self.per_patch_audio and self.model._audio_emit_every > 1,
             )
         return logits
 
@@ -229,8 +336,14 @@ class VoxCPM2ModelState(OmniModelState):
         self, state: Any, stop_logits: torch.Tensor, next_embed: torch.Tensor, pred_feat: torch.Tensor
     ) -> None:
         index = self._slot_for(state)
-        self.next_embed[index].copy_(next_embed.reshape(-1))
-        self.prefix_feat[index].copy_(pred_feat.reshape(self.model._patch_size, self.model._feat_dim))
+        embed = next_embed.reshape(-1)
+        features = pred_feat.reshape(self.model._patch_size, self.model._feat_dim)
+        if self.per_patch_audio:
+            active = self.graph_active[index]
+            embed = torch.where(active, embed.to(self.next_embed.dtype), self.next_embed[index])
+            features = torch.where(active, features.to(self.prefix_feat.dtype), self.prefix_feat[index])
+        self.next_embed[index].copy_(embed)
+        self.prefix_feat[index].copy_(features)
         self.stop_logits[index].copy_(stop_logits.reshape(-1)[:2])
         state.decode_state_ready = True
         state.audio_patch_ready = True
@@ -246,10 +359,15 @@ class VoxCPM2ModelState(OmniModelState):
         batch_context: VoxCPM2BatchSlots | None = None,
     ) -> None:
         indices = self.indices_for(states, batch_context)
-        self.next_embed.index_copy_(0, indices, next_embed.reshape(len(states), -1).to(dtype=self.next_embed.dtype))
+        embed = next_embed.reshape(len(states), -1).to(dtype=self.next_embed.dtype)
         features = pred_feat.reshape(len(states), self.model._patch_size, self.model._feat_dim).to(
             dtype=self.prefix_feat.dtype
         )
+        if self.per_patch_audio:
+            active = self.graph_active.index_select(0, indices)
+            embed = torch.where(active[:, None], embed, self.next_embed.index_select(0, indices))
+            features = torch.where(active[:, None, None], features, self.prefix_feat.index_select(0, indices))
+        self.next_embed.index_copy_(0, indices, embed)
         self.prefix_feat.index_copy_(0, indices, features)
         self.stop_logits.index_copy_(
             0, indices, stop_logits.reshape(len(states), -1)[:, :2].to(dtype=self.stop_logits.dtype)
@@ -434,9 +552,47 @@ class VoxCPM2ModelState(OmniModelState):
         input_batch: Any,
         req_states: Any,
         outputs: dict[str, Any],
-    ) -> VoxCPM2AudioOutput:
+    ) -> VoxCPM2AudioOutput | PerPatchPCMOutput:
         count = input_batch.num_reqs
         slots = input_batch.idx_mapping_np[:count]
+        if self.per_patch_audio:
+            requests = []
+            for slot in slots:
+                req_id = self.slots[int(slot)].request_id
+                if req_id not in self.pcm_stream.requests:
+                    request = self.pcm_stream.add(req_id)
+                    request.emitted = True  # VoxCPM2 emits at the configured interval.
+                requests.append(self.pcm_stream.requests[req_id])
+            if self._step_pcm is not None:
+                pcm, valid, copy_done = self._step_pcm
+                self._step_pcm = None
+            else:
+                samples = self.model._patch_size * int(self.model.tts.audio_vae.decode_chunk_size)
+                pcm = (
+                    torch.stack(
+                        [self._fallback_pcm.get(int(slot), self.audio_buffer.new_zeros(samples)) for slot in slots]
+                    )
+                    if count
+                    else self.audio_buffer.new_empty((0, samples))
+                )
+                valid = (
+                    torch.stack(
+                        [self._fallback_valid.get(int(slot), self.graph_active.new_zeros(())) for slot in slots]
+                    )
+                    if count
+                    else self.graph_active.new_empty(0)
+                )
+                copy_done = None
+            self._fallback_pcm.clear()
+            self._fallback_valid.clear()
+            return PerPatchPCMOutput(
+                pcm,
+                valid,
+                self._step_ended,
+                torch.tensor(self.model._sample_rate, dtype=torch.int32),
+                requests,
+                copy_done,
+            )
         lengths = self.audio_output_lengths[slots]
         ends_by_length = self.model._audio_length_limit_reached(
             input_batch.num_computed_tokens_np[:count],
@@ -465,6 +621,23 @@ class VoxCPM2ModelState(OmniModelState):
         state.request_id = request_id
         state.slot_index = req_index
         self.intermediate_buffer.buffers[req_index]["slot_index"] = req_index
+        if getattr(self, "incremental_vae", False):
+            parked_features = self.suspended_vae_features.pop(request_id, {})
+            for name, cache in self.vae_feature_cache.items():
+                if name in parked_features:
+                    cache[req_index].copy_(parked_features[name])
+                else:
+                    cache[req_index].zero_()
+        if self.per_patch_audio:
+            self.graph_active[req_index].fill_(True)
+            self.graph_context[req_index].zero_()
+            self.graph_context_lengths[req_index].zero_()
+            parked_graph = self.suspended_graph.pop(request_id, None)
+            if parked_graph is not None:
+                context, length, active = parked_graph
+                self.graph_context[req_index].copy_(context)
+                self.graph_context_lengths[req_index].copy_(length)
+                self.graph_active[req_index].copy_(active)
         parked = self.suspended.pop(request_id, None)
         audio_parked = self.suspended_audio.pop(request_id, None)
         if audio_parked is not None:
@@ -508,7 +681,14 @@ class VoxCPM2ModelState(OmniModelState):
             if state.request_id:
                 self.model._active_states.pop(state.request_id, None)
             state.slot_index = None
+            if self.per_patch_audio:
+                self.graph_active[req_index].fill_(False)
+                self._fallback_pcm.pop(req_index, None)
+                self._fallback_valid.pop(req_index, None)
             self.audio_output_lengths[req_index] = 0
+            if getattr(self, "incremental_vae", False):
+                for cache in self.vae_feature_cache.values():
+                    cache[req_index].zero_()
             fresh = _RequestState(request_id="")
             for field in dataclasses.fields(state):
                 setattr(state, field.name, getattr(fresh, field.name))
@@ -518,6 +698,16 @@ class VoxCPM2ModelState(OmniModelState):
         super().on_request_preempted(req_id, req_index)
         state = self.slots[req_index]
         if state.request_id:
+            if getattr(self, "incremental_vae", False):
+                self.suspended_vae_features[state.request_id] = {
+                    name: cache[req_index].clone() for name, cache in self.vae_feature_cache.items()
+                }
+            if self.per_patch_audio:
+                self.suspended_graph[state.request_id] = (
+                    self.graph_context[req_index].clone(),
+                    self.graph_context_lengths[req_index].clone(),
+                    self.graph_active[req_index].clone(),
+                )
             length = self.audio_output_lengths[req_index]
             if length:
                 self.suspended_audio[state.request_id] = (self.audio_buffer[req_index, :length].clone(), length)
@@ -547,6 +737,12 @@ class VoxCPM2ModelState(OmniModelState):
 
     def on_requests_finished(self, req_ids: set[str]) -> None:
         super().on_requests_finished(req_ids)
+        if self.per_patch_audio:
+            self.pcm_stream.finish(req_ids)
+            for req_id in req_ids:
+                self.suspended_graph.pop(req_id, None)
         for req_id in req_ids:
+            if getattr(self, "incremental_vae", False):
+                self.suspended_vae_features.pop(req_id, None)
             self.suspended.pop(req_id, None)
             self.suspended_audio.pop(req_id, None)

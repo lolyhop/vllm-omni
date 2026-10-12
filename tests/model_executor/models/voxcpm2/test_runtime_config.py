@@ -52,6 +52,20 @@ def test_generation_config_defaults() -> None:
     assert config.cfg_cutoff_ratio == 1.0
 
 
+def test_incremental_vae_disables_legacy_batching_without_conflict_warning(monkeypatch) -> None:
+    from vllm_omni.model_executor.models.voxcpm2 import runtime_config
+
+    warnings = []
+    monkeypatch.setattr(runtime_config.logger, "warning", lambda *args: warnings.append(args))
+    config = _VoxCPM2RuntimeConfig(
+        enable_incremental_vae=True, vae_decode_every=1, audio_emit_every=3, enable_batched_vae_decode=True
+    )._normalized()
+    assert config.enable_incremental_vae
+    assert not config.enable_batched_vae_decode
+    assert config.audio_emit_every == 3
+    assert not warnings
+
+
 class _CountingEstimator(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
