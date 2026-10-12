@@ -24,8 +24,8 @@ def _model():
     return model
 
 
-@pytest.mark.parametrize("chunked,uses_v2,expected", [(False, True, True), (True, True, False), (False, False, False)])
-def test_mixed_graph_requires_v2_full_prefill(chunked, uses_v2, expected):
+@pytest.mark.parametrize("chunked,uses_v2,expected", [(False, True, True), (True, True, True), (False, False, False)])
+def test_mixed_graph_requires_v2_for_both_prefill_modes(chunked, uses_v2, expected):
     model = _model()
     model._mrv2_model_state = object() if uses_v2 else None
     model.vllm_config.scheduler_config.enable_chunked_prefill = chunked
@@ -69,7 +69,7 @@ def test_mixed_graph_packs_prefill_masks_and_decode_conditions(monkeypatch):
     assert not graph.prefix_feat_cond[2:].any()
 
 
-@pytest.mark.parametrize("uses_v2,chunked,defer", [(True, False, False), (True, True, True), (False, False, True)])
+@pytest.mark.parametrize("uses_v2,chunked,defer", [(True, False, False), (True, True, False), (False, False, True)])
 def test_mixed_admission_removes_only_graph_specific_restriction(monkeypatch, uses_v2, chunked, defer):
     from vllm.v1.request import RequestStatus
 
@@ -318,3 +318,31 @@ def test_per_patch_single_decode_requests_capture_safe_metadata():
     assert request.num_reqs_padded == 1
     assert request.num_tokens_padded is None
     assert request.for_cudagraph_capture
+
+
+def test_chunked_prefill_graph_uses_current_chunk_masks_and_conditioning():
+    model = _model()
+    model.vllm_config.scheduler_config.enable_chunked_prefill = True
+    model._mrv2_model_state = SimpleNamespace(per_patch_audio=True)
+    assert model._mixed_unified_graph_enabled()
+    state = _RequestState(request_id="chunk", prefill_chunk_start=2)
+    state.prefill_masks = (
+        torch.tensor([[1.0, 1.0, 0.0, 1.0, 0.0]]),
+        torch.tensor([[0.0, 0.0, 1.0, 0.0, 1.0]]),
+        torch.arange(20.0).reshape(1, 5, 2, 2),
+        torch.arange(20.0).reshape(1, 5, 4),
+    )
+    graph = SimpleNamespace(
+        batch_size=1,
+        text_mask=torch.empty(4, 1),
+        prev_feat_embed=torch.empty(4, 4),
+        prefix_feat_cond=torch.empty(1, 2, 2),
+        last_token_indices=torch.empty(1, dtype=torch.long),
+    )
+    model._pending_requests = [(state, True, None, 2)]
+    model._prepare_mixed_graph_inputs(graph, 1)
+    assert graph.text_mask[:, 0].tolist() == [0.0, 1.0, 0.0, 0.0]
+    torch.testing.assert_close(graph.prev_feat_embed[0], state.prefill_masks[3][0, 2])
+    assert not graph.prev_feat_embed[1:].any()
+    torch.testing.assert_close(graph.prefix_feat_cond[0], state.prefill_masks[2][0, 3])
+    assert graph.last_token_indices.tolist() == [1]

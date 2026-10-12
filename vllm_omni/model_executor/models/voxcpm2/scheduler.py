@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -32,11 +32,8 @@ class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler):
     def _should_defer_waiting_for_unified_decode_graph(self) -> bool:
         if not self._unified_decode_graph_enabled():
             return False
-        if (
-            getattr(self.vllm_config.model_config, "use_v2_model_runner", False)
-            and not self.vllm_config.scheduler_config.enable_chunked_prefill
-        ):
-            # The model-owned varlen graph accepts admitted full prefills.
+        if getattr(self.vllm_config.model_config, "use_v2_model_runner", False):
+            # Mixed batches admit both full and chunked prefills.
             return False
         if not (self.waiting or self.kv_holding_waiting) or not self.running:
             return False

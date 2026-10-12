@@ -138,4 +138,4 @@ def test_graph_commit_preserves_inactive_request_state():
     )
     assert owner.next_embed[:, 0].tolist() == [1.0, 7.0, 7.0]
     assert owner.prefix_feat[:, 0, 0].tolist() == [1.0, 9.0, 9.0]
-    assert owner.stop_logits.tolist() == [[3.0, 3.0]] * 3
+    assert owner.stop_logits.tolist() == [[3.0, 3.0], [0.0, 0.0], [0.0, 0.0]]

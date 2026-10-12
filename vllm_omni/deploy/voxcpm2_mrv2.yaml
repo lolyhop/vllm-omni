@@ -3,7 +3,6 @@ base_config: voxcpm2.yaml
 model_runner: v2
 stages:
   - stage_id: 0
-    enable_chunked_prefill: false
     engine_extras:
       hf_overrides:
         voxcpm2_runtime_config:

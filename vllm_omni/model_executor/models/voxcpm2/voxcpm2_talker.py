@@ -344,6 +344,7 @@ class _RequestState:
     request_start_time: float = 0.0
     prefill_completed: bool = False
     is_last_prefill_chunk: bool = False
+    prefill_chunk_start: int = 0
     prompt_cache: dict | None = None
     prefill_masks: tuple | None = None
     is_stopping: bool = False
@@ -2065,7 +2066,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state = self._pending_state(request)
             states.append(state)
             already_stopping = state.is_stopping
-            commit_patch_mask.append(not already_stopping)
+            commit_patch_mask.append(not already_stopping and (not _is_prefill or state.is_last_prefill_chunk))
             if not already_stopping and not _is_prefill:
                 state.decode_step_count += 1
                 if state.decode_step_count >= self._max_decode_steps:
@@ -2144,7 +2145,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             )
         if model_state is not None and g.pcm is not None:
             # Tensor commits run on GPU; request control flags stay on host.
-            for state in states:
+            for state, committed in zip(states, commit_patch_mask, strict=True):
+                if not committed:
+                    continue
                 state.decode_state_ready = True
                 state.stop_logits_ready = True
                 state.precomputed_is_stopping = None
@@ -2194,7 +2197,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         if mixed_token_capacity is not None:
             for state, (_, is_prefill, _, _) in zip(states, self._pending_requests, strict=True):
-                if is_prefill:
+                if is_prefill and state.is_last_prefill_chunk:
                     state.decode_step_count = 0
                     state.request_start_time = time.perf_counter()
                     state.prefill_completed = True
@@ -2206,9 +2209,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             g.audio_copy_event = torch.cuda.Event()
             model_state._pcm_copy_event = g.audio_copy_event
             model_state._step_pcm = (g.pcm[:num_reqs], g.pcm_valid[:num_reqs], g.audio_copy_event)
-            for state in states:
+            for state, committed in zip(states, commit_patch_mask, strict=True):
                 state.audio_patch_ready = False
-                self._results_queue.append((state, self._state_tensor(state, "precomputed_stop_logits")))
+                logits = self._state_tensor(state, "precomputed_stop_logits") if committed else None
+                self._results_queue.append((state, logits))
                 self._audio_queue.append((state, None))
             self._pending_requests.clear()
             self._flush_deferred_cleanup()
@@ -2229,11 +2233,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         return g.scaffold_hidden[:num_tokens] if mixed_token_capacity is not None else g.next_feat_embed[:num_reqs]
 
     def _mixed_unified_graph_enabled(self) -> bool:
-        return (
-            self._enable_unified_decode_graph
-            and getattr(self, "_mrv2_model_state", None) is not None
-            and not getattr(getattr(self.vllm_config, "scheduler_config", None), "enable_chunked_prefill", True)
-        )
+        return self._enable_unified_decode_graph and getattr(self, "_mrv2_model_state", None) is not None
 
     def _mixed_token_capacity(self, num_tokens: int, request_bucket: int) -> int | None:
         limit = self.vllm_config.scheduler_config.max_num_batched_tokens
@@ -2253,11 +2253,16 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             state = self._pending_state(owner)
             if is_prefill:
                 text_mask, audio_mask, audio_feat, feat_embed = state.prefill_masks
+                start = state.prefill_chunk_start
+                end = start + count
+                text_mask = text_mask[:, start:end]
+                audio_mask = audio_mask[:, start:end]
+                feat_embed = feat_embed[:, start:end]
                 g.text_mask[offset : offset + count].copy_(text_mask.reshape(-1, 1))
                 g.prev_feat_embed[offset : offset + count].copy_(
                     (audio_mask.unsqueeze(-1) * feat_embed).reshape(count, -1)
                 )
-                g.prefix_feat_cond[row].copy_(audio_feat[0, -1])
+                g.prefix_feat_cond[row].copy_(audio_feat[0, end - 1])
             else:
                 g.prev_feat_embed[offset].copy_(self._state_tensor(state, "prev_feat_embed").reshape(-1))
                 g.prefix_feat_cond[row].copy_(self._state_tensor(state, "curr_prefix_feat_cond"))
@@ -2396,7 +2401,10 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             and num_reqs > 0
             and all(
                 (
-                    self._pending_state(owner).is_last_prefill_chunk
+                    (
+                        getattr(self._mrv2_model_state, "per_patch_audio", False)
+                        or self._pending_state(owner).is_last_prefill_chunk
+                    )
                     if is_prefill
                     else self._pending_state(owner).decode_state_ready
                 )
@@ -3981,6 +3989,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 embeds = (text_mask.unsqueeze(-1) * text_embed + feat_mask.unsqueeze(-1) * feat_embed).squeeze(0)
                 state.prefill_masks = (text_mask, feat_mask, inputs.audio_feat, feat_embed)
                 state.prefill_embeds = embeds
+            state.prefill_chunk_start = num_computed_tokens
             chunk_end = num_computed_tokens + span_len
             state.is_last_prefill_chunk = chunk_end == state.prefill_embeds.shape[0]
             if chunk_end > state.prefill_embeds.shape[0]:

@@ -241,7 +241,13 @@ class VoxCPM2ModelState(OmniModelState):
         features = self.prefix_feat.index_select(0, slots)
         self.next_embed.index_copy_(0, slots, torch.where(valid[:, None], next_embed.to(embeds.dtype), embeds))
         self.prefix_feat.index_copy_(0, slots, torch.where(valid[:, None, None], patch.to(features.dtype), features))
-        self.stop_logits.index_copy_(0, slots, stop_logits[:, :2].to(self.stop_logits.dtype))
+        self.stop_logits.index_copy_(
+            0,
+            slots,
+            torch.where(
+                valid[:, None], stop_logits[:, :2].to(self.stop_logits.dtype), self.stop_logits.index_select(0, slots)
+            ),
+        )
 
     def record_eager_pcm(self, state, pcm, valid):
         slot = self._slot_for(state)
