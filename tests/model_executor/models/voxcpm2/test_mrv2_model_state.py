@@ -212,7 +212,7 @@ def test_batch_slot_indices_reuse_runner_mapping(monkeypatch: pytest.MonkeyPatch
     assert selected.tolist() == [1, 0]
 
 
-def test_mrv2_hot_path_uses_bound_slot_without_request_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mrv2_buffer_access_uses_bound_slot_without_runner_id_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
     model = _talker(torch.device("cpu"))
     state = _state(model, 2, torch.device("cpu"), monkeypatch)
     state.add_request(1, SimpleNamespace(req_id="first"))
@@ -220,7 +220,7 @@ def test_mrv2_hot_path_uses_bound_slot_without_request_lookup(monkeypatch: pytes
     state.intermediate_buffer.req_id_to_index.clear()
     state.store_decode_state(owner, torch.tensor([[0.0, 1.0]]), torch.ones(6), torch.ones(4, 2))
     assert state.tensor_for(owner, "curr_embed_for_next").tolist() == [[1.0] * 6]
-    model._audio_queue = [(owner, torch.tensor([3.0]))]
+    model._audio_queue = [(owner.request_id, torch.tensor([3.0]))]
     state.make_audio_output(torch.zeros(1, 6), ["first"])
     assert state.audio_buffer[1, 0].item() == 3.0
     state.remove_request(1)
@@ -242,7 +242,7 @@ def test_compute_logits_batches_mixed_slot_outcomes(monkeypatch: pytest.MonkeyPa
     state.slots[3].precomputed_is_stopping = True
     model._results_queue = [
         (
-            state.slots[slot],
+            state.slots[slot].request_id,
             state.tensor_for(state.slots[slot], "precomputed_stop_logits") if slot in (4, 1, 3) else None,
         )
         for slot in (4, 1, 2, 0, 3)
@@ -257,7 +257,7 @@ def test_compute_logits_batches_mixed_slot_outcomes(monkeypatch: pytest.MonkeyPa
     assert state.slots[3].is_stopping
     assert all(not slot.stop_logits_ready for slot in (state.slots[4], state.slots[1], state.slots[3]))
     assert model._results_queue == []
-    model._results_queue = [(state.slots[0], None)]
+    model._results_queue = [(state.slots[0].request_id, None)]
     short = model.compute_logits(torch.zeros(2, 6))
     assert short[0, 0] == 1.0
     assert torch.isneginf(short[1]).all()
@@ -275,7 +275,8 @@ def test_compute_logits_full_decode_batch_preserves_row_order(monkeypatch: pytes
             state.slots[index], torch.tensor([[float(index), float(index + 1)]]), torch.zeros(6), torch.zeros(4, 2)
         )
     model._results_queue = [
-        (state.slots[index], state.tensor_for(state.slots[index], "precomputed_stop_logits")) for index in (2, 0, 1)
+        (state.slots[index].request_id, state.tensor_for(state.slots[index], "precomputed_stop_logits"))
+        for index in (2, 0, 1)
     ]
     logits = model.compute_logits(torch.zeros(3, 6))
     torch.testing.assert_close(logits[:, :2], torch.tensor([[2.0, 3.0], [0.0, 1.0], [1.0, 2.0]]))
@@ -308,7 +309,7 @@ def test_cuda_stop_logits_match_legacy_path(monkeypatch, dtype, vocab_size) -> N
         state.slots[3].precomputed_is_stopping = True
         model._results_queue = [
             (
-                state.slots[slot],
+                state.slots[slot].request_id,
                 state.tensor_for(state.slots[slot], "precomputed_stop_logits") if slot in (4, 1, 3) else None,
             )
             for slot in order
@@ -435,7 +436,7 @@ def test_length_limit_decodes_pending_latent_tail(
     model._run_vae_decode = decode
     state.prepare_audio_length_limits(batch, req_states)
     audio = model._collect_audio_batch([state.slots[1], state.slots[0]])
-    model._audio_queue = [(state.slots[slot], chunk) for slot, chunk in audio.items()]
+    model._audio_queue = list(audio.items())
     state.make_audio_output(torch.zeros(2, 6), ["ending", "running"])
     output = state.prepare_streaming_audio_output(batch, req_states, {"voxcpm2_audio_pending": True}).get_output()
 
@@ -455,11 +456,11 @@ def test_chunk_output_copies_audio_and_valid_lengths_together() -> None:
         copied.append(value)
         return value.clone()
 
-    output = VoxCPM2AudioOutput(torch.arange(3), torch.tensor([3]), torch.tensor(48000), (0,), 2)
+    output = VoxCPM2AudioOutput.packed(torch.arange(3), torch.tensor([3]), torch.tensor(48000), (0,), 2)
     host = output.to_cpu(None, copy_tensor)
     assert copied[0] is output.wav
     assert len(copied) == 1
-    assert host.valid_samples is output.valid_samples
+    assert host.metadata.lengths is output.metadata.lengths
     assert host.get_output()[0]["model_outputs"].tolist() == [0, 1, 2]
     assert host.get_output()[1] is None
 
@@ -647,8 +648,8 @@ def test_batched_audio_uses_slots_for_reordered_cohort(monkeypatch: pytest.Monke
     cohort = [state.slots[2], state.slots[0]]
     batch_context = VoxCPM2BatchSlots(torch.tensor([2, 1, 0]), {2: 0, 1: 1, 0: 2})
     output = model._collect_audio_batch(cohort, batch_context=batch_context)
-    assert list(output) == [2, 0]
-    assert output[2] is None and output[0] is None
+    assert list(output) == [slot.request_id for slot in cohort]
+    assert all(value is None for value in output.values())
     assert state.audio_buffer[2].tolist() == [6.0] * 32
     assert state.audio_buffer[0].tolist() == [2.0] * 32
     assert state.slots[2].decode_pad_len == state.slots[0].decode_pad_len == 4
@@ -672,7 +673,7 @@ def test_decode_batch_restores_mixed_prefill_batch_order(monkeypatch: pytest.Mon
             input_ids=torch.zeros(2, dtype=torch.long), input_embeds=torch.zeros(2, 6), req_infos=infos
         )
         assert embeds.tolist() == [[7.0] * 6, [0.0] * 6]
-        model._pending_requests.append((state.slots[0], True, None, 3))
+        model._pending_requests.append((state.slots[0].request_id, True, None, 3))
         model._pending_batch_rows.append(state.intermediate_buffer.buffers[0]["batch_row"])
 
     monkeypatch.setattr(OmniModelState, "run_preprocess", run_generic)
@@ -680,7 +681,7 @@ def test_decode_batch_restores_mixed_prefill_batch_order(monkeypatch: pytest.Mon
         SimpleNamespace(idx_mapping_np=np.array([2, 0, 1]), idx_mapping=torch.tensor([2, 0, 1]), num_reqs=3), {}
     )
     assert state.preprocess_batch_slots is None
-    assert [request.request_id for request, *_ in model._pending_requests] == ["ready", "prefill", "unready"]
+    assert [request for request, *_ in model._pending_requests] == ["ready", "prefill", "unready"]
     assert model._pending_batch_rows is None
     assert all("batch_row" not in info for info in state.intermediate_buffer.buffers)
 
@@ -948,9 +949,10 @@ def test_per_patch_logits_use_gpu_active_and_preserve_stop_scores(monkeypatch, e
             torch.zeros(4, 2, device="cuda"),
         )
     state.per_patch_audio = True
-    state.graph_active = torch.tensor([False, True, True, False], device="cuda")
+    state.active_slots = torch.tensor([False, True, True, False], device="cuda")
     model._results_queue = [
-        (state.slots[slot], state.tensor_for(state.slots[slot], "precomputed_stop_logits")) for slot in (2, 0, 1)
+        (state.slots[slot].request_id, state.tensor_for(state.slots[slot], "precomputed_stop_logits"))
+        for slot in (2, 0, 1)
     ]
     logits = model.compute_logits(torch.zeros(3, 6, device="cuda"))
     expected = [[0.0, 1.0] if emit_every > 1 else [0.2, 0.8], [0.0, 1.0], [0.4, 0.1]]
@@ -966,24 +968,24 @@ def test_per_patch_preemption_restores_context_and_pending_api_audio(monkeypatch
     state = _state(model, 2, torch.device("cpu"), monkeypatch)
     # Exercise lifecycle on CPU; production enables this state only on CUDA.
     state.per_patch_audio = True
-    state.graph_active = torch.zeros(3, dtype=torch.bool)
-    state.graph_context = torch.zeros(3, 12, 2)
-    state.graph_context_lengths = torch.zeros(3, dtype=torch.long)
-    state.suspended_graph = {}
+    state.active_slots = torch.zeros(3, dtype=torch.bool)
+    state.latent_context = torch.zeros(3, 12, 2)
+    state.latent_context_lengths = torch.zeros(3, dtype=torch.long)
+    state.suspended_patch_state = {}
     state.pcm_stream = StreamingAudioBuffer(32, 2)
     state.add_request(0, SimpleNamespace(req_id="first"))
-    state.graph_context[0, :4].fill_(7)
-    state.graph_context_lengths[0] = 4
+    state.latent_context[0, :4].fill_(7)
+    state.latent_context_lengths[0] = 4
     audio = state.pcm_stream.add("first")
     audio.emitted = True
     assert audio.push(torch.ones(32), ended=False) is None
     state.on_request_preempted("first", 0)
     state.remove_request(0)
     state.add_request(0, SimpleNamespace(req_id="other"))
-    state.graph_context[0].fill_(9)
+    state.latent_context[0].fill_(9)
     state.add_request(1, SimpleNamespace(req_id="first"))
-    assert state.graph_active.tolist() == [True, True, False]
-    assert state.graph_context_lengths[1] == 4
-    assert state.graph_context[1, :4].tolist() == [[7.0, 7.0]] * 4
+    assert state.active_slots.tolist() == [True, True, False]
+    assert state.latent_context_lengths[1] == 4
+    assert state.latent_context[1, :4].tolist() == [[7.0, 7.0]] * 4
     assert state.pcm_stream.requests["first"] is audio
     assert audio.push(torch.full((32,), 2.0), ended=False).tolist() == [1.0] * 32 + [2.0] * 32

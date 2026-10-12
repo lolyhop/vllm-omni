@@ -126,9 +126,9 @@ def test_voxcpm2_streaming_output_owns_channels_and_finalizes_once(monkeypatch, 
         text_hidden=torch.arange(8, dtype=torch.float32).reshape(4, 2) if include_hidden else None,
         multimodal_outputs={"voxcpm2_audio_pending": True},
         input_batch=input_batch,
-        streaming_audio=VoxCPM2AudioOutput(
+        streaming_audio=VoxCPM2AudioOutput.packed(
             wav=audio if has_audio else torch.empty(0),
-            valid_samples=torch.tensor([audio.numel()] if has_audio else [], dtype=torch.long),
+            lengths=torch.tensor([audio.numel()] if has_audio else [], dtype=torch.long),
             sample_rate=torch.tensor(48000),
             batch_rows=(1,) if has_audio else (),
             num_reqs=2,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """VoxCPM2 dense-mode audio outputs must carry the sparse-alignment marker.
 
 Dense mode (`_uses_sparse_audio_outputs()` False) still yields a strict

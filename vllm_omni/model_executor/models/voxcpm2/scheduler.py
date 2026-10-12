@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from __future__ import annotations
 
@@ -12,15 +12,10 @@ from .runtime_config import _VoxCPM2RuntimeConfig
 
 
 class VoxCPM2OmniARAsyncScheduler(OmniARAsyncScheduler):
-    """VoxCPM2 scheduler variant for full unified decode graph serving.
+    """Preserve MRV1 decode-only graph admission; MRV2 accepts mixed batches.
 
-    VoxCPM2's full unified decode graph only applies to pure decode batches.
-    MRV2 with chunked prefill disabled also supports a mixed varlen graph,
-    which does not require this admission restriction. Otherwise,
-    when a decode-ready request is already running, this scheduler defers new
-    waiting admissions for the current tick so the decode batch can stay on the
-    VoxCPM2 graph path. This is a model-local serving policy, not a generic AR
-    scheduler rule.
+    MRV2 full and chunked prefills share the mixed varlen graph path, so running
+    decode requests do not require deferring new waiting requests.
     """
 
     def _unified_decode_graph_enabled(self) -> bool:

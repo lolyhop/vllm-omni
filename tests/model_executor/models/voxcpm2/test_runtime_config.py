@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,6 +10,30 @@ import torch
 from vllm_omni.model_executor.models.voxcpm2.runtime_config import _VoxCPM2RuntimeConfig
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.parametrize("uses_v2", [False, True])
+def test_runner_specific_audio_defaults(uses_v2):
+    config = _VoxCPM2RuntimeConfig.from_vllm_config(
+        SimpleNamespace(model_config=SimpleNamespace(use_v2_model_runner=uses_v2))
+    )
+    assert config.enable_incremental_vae is uses_v2
+    assert config.vae_decode_every == (1 if uses_v2 else 3)
+    assert config.audio_emit_every == (3 if uses_v2 else 1)
+
+
+def test_mrv2_explicit_legacy_audio_override():
+    config = _VoxCPM2RuntimeConfig.from_vllm_config(
+        SimpleNamespace(
+            model_config=SimpleNamespace(
+                use_v2_model_runner=True,
+                voxcpm2_runtime_config={"enable_incremental_vae": False, "vae_decode_every": 3, "audio_emit_every": 1},
+            )
+        )
+    )
+    assert not config.enable_incremental_vae
+    assert config.vae_decode_every == 3
+    assert config.audio_emit_every == 1
 
 
 @dataclass
@@ -50,6 +75,12 @@ def test_generation_config_defaults() -> None:
     assert config.inference_timesteps == 10
     assert config.cfg_value == 2.0
     assert config.cfg_cutoff_ratio == 1.0
+    assert config.mixed_graph_cache_limit == 0
+
+
+def test_mixed_graph_cache_limit_rejects_negative():
+    with pytest.raises(ValueError, match="mixed_graph_cache_limit"):
+        _VoxCPM2RuntimeConfig.from_vllm_config(_VllmConfig(_ModelConfig({"mixed_graph_cache_limit": -1})))
 
 
 def test_incremental_vae_disables_legacy_batching_without_conflict_warning(monkeypatch) -> None:

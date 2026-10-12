@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Static regression checks for VoxCPM2 runner-assisted unified graph hooks.
 
 These tests intentionally avoid importing torch/vLLM so they can run in a

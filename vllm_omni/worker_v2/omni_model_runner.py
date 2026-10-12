@@ -610,10 +610,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 )
                 input_batch = replace(input_batch, max_query_len=query_bound)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
-            if runner_assisted_request is not None and input_batch.num_reqs_after_padding > input_batch.num_reqs:
-                # prepare_pos_seq_lens only writes real rows. The graph's
-                # padded attention rows must have zero sequence length.
-                input_batch.seq_lens[input_batch.num_reqs :].zero_()
             self.model_state.preprocess_state(
                 input_batch,
                 block_tables,

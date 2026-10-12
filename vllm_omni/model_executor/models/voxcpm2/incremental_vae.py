@@ -39,11 +39,12 @@ def incremental_vae_context(vae, caches, slots, valid, num_slots):
                 if not history:
                     continue
 
-                def forward(x, mod=module, key=name, size=history, right=trim):
-                    joined = cached_input(key, x, size)
-                    out = nn.ConvTranspose1d.forward(mod, joined)
-                    left = size * mod.stride[0]
-                    return out[..., left:-right] if right else out[..., left:]
+                def forward(x, conv=module, cache_key=name, history_frames=history, right_trim=trim):
+                    joined = cached_input(cache_key, x, history_frames)
+                    out = nn.ConvTranspose1d.forward(conv, joined)
+                    # Drop outputs for cached input positions and the causal right trim.
+                    left = history_frames * conv.stride[0]
+                    return out[..., left:-right_trim] if right_trim else out[..., left:]
 
             elif isinstance(module, nn.Conv1d):
                 if type(module).__name__ != "CausalConv1d":
@@ -54,8 +55,8 @@ def incremental_vae_context(vae, caches, slots, valid, num_slots):
                 if not history:
                     continue
 
-                def forward(x, mod=module, key=name, size=history):
-                    return nn.Conv1d.forward(mod, cached_input(key, x, size))
+                def forward(x, conv=module, cache_key=name, history_frames=history):
+                    return nn.Conv1d.forward(conv, cached_input(cache_key, x, history_frames))
 
             else:
                 continue
