@@ -307,28 +307,6 @@ def _prepare_raw_audio(
     return audio
 
 
-def _encode_raw_audio_batch(
-    tts: nn.Module,
-    items: list[tuple[list[float] | torch.Tensor | bytes, int, str]],
-) -> list[torch.Tensor]:
-    """Batch only identical-length VAE inputs; never pad across requests."""
-    prepared = [
-        _prepare_raw_audio(tts, samples, sr, padding_mode=padding_mode, keep_on_device=True)
-        for samples, sr, padding_mode in items
-    ]
-    result: list[torch.Tensor | None] = [None] * len(items)
-    groups: dict[int, list[int]] = {}
-    for row, audio in enumerate(prepared):
-        groups.setdefault(audio.shape[-1], []).append(row)
-    for rows in groups.values():
-        feat = tts.audio_vae.encode(torch.cat([prepared[row] for row in rows], dim=0), tts._encode_sample_rate)
-        for i, row in enumerate(rows):
-            result[row] = feat[i].reshape(tts.audio_vae.latent_dim, -1, tts.patch_size).permute(1, 2, 0)
-    if any(feat is None for feat in result):
-        raise RuntimeError("VoxCPM2 batch audio encoder did not return every request")
-    return [feat for feat in result if feat is not None]
-
-
 # ===================================================================
 #  Per-request state
 # ===================================================================
@@ -3442,7 +3420,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     # -------------------- preprocess / postprocess --------------------
 
     def preprocess_batch_mrv2(self, *, req_infos: list[dict[str, Any]], device: torch.device) -> None:
-        """Batch new V2 prefill embeddings and compatible raw voice audio."""
+        """Batch new V2 prefill embeddings after per-request audio encoding."""
         candidates: list[tuple[dict[str, Any], torch.Tensor]] = []
         split_map = self._get_multichar_zh_split()
         for info in req_infos:
@@ -3477,11 +3455,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             for (info, _), text_embed in zip(candidates, embedded.split(lengths), strict=True):
                 info["prefill_text_embed"] = text_embed
 
-        # Raw reference/continuation audio can be encoded together only after
-        # each waveform has received its own resampling and boundary padding.
+        # Encode waveforms individually; batch the downstream prefill embeddings.
         voice: list[tuple[dict[str, Any], _RequestState, list[int], object, object, str | None]] = []
-        raw_items: list[tuple[list[float] | torch.Tensor | bytes, int, str]] = []
-        raw_owners: list[tuple[int, str]] = []
         for info in req_infos:
             extra = info.get("additional_information")
             data = {**extra, **info} if isinstance(extra, dict) else info
@@ -3533,31 +3508,16 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 continue
             if token_ids[0] == self.config.bos_token_id:
                 token_ids = token_ids[1:]
-            owner = len(voice)
             voice.append((info, state, token_ids, ref, prompt, text))
-            for name, value, mode in (
-                ("ref_audio_feat", ref, "right"),
-                ("audio_feat", prompt if text is not None else None, "left"),
-            ):
-                if value is not None:
-                    samples, sr = value
-                    raw_items.append((samples, sr, mode))
-                    raw_owners.append((owner, name))
 
         if len(voice) < 2:
             return
-        caches: list[dict[str, Any]] = [{"prompt_text": text} if text is not None else {} for *_, text in voice]
-        for (owner, name), feat in zip(raw_owners, _encode_raw_audio_batch(self.tts, raw_items), strict=True):
-            caches[owner][name] = feat
+        caches = [
+            self._build_prompt_cache(ref_audio=ref, prompt_audio=prompt, prompt_text=text)
+            for _, _, _, ref, prompt, text in voice
+        ]
         prepared: list[_PrefillInputs] = []
-        for (_, state, token_ids, ref, prompt, _text), cache in zip(voice, caches, strict=True):
-            cache["mode"] = (
-                "ref_continuation"
-                if ref is not None and prompt is not None
-                else "reference"
-                if ref is not None
-                else "continuation"
-            )
+        for (_, state, token_ids, *_), cache in zip(voice, caches, strict=True):
             state.prompt_cache = cache
             try:
                 prepared.append(self._build_prefill_inputs(token_ids, device, state=state))
@@ -3898,9 +3858,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             all_ids = token_ids
 
         work_device = dev if getattr(self, "_mrv2_model_state", None) is not None else torch.device("cpu")
-        text_token = torch.tensor(all_ids, dtype=torch.int32, device=work_device)
-        text_token = torch.cat(
-            [text_token, torch.tensor([tts.audio_start_token], dtype=torch.int32, device=work_device)], dim=-1
+        use_async_h2d = work_device.type == "cuda"
+        text_token = torch.tensor([*all_ids, tts.audio_start_token], dtype=torch.int32, pin_memory=use_async_h2d).to(
+            work_device, non_blocking=use_async_h2d
         )
         text_len = text_token.shape[0]
         latent_dim = tts.audio_vae.latent_dim

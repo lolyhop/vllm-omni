@@ -17,7 +17,6 @@ from vllm_omni.model_executor.models.voxcpm2.model_state import (
 from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
     VoxCPM2TalkerForConditionalGeneration,
     _encode_raw_audio,
-    _encode_raw_audio_batch,
     _PrefillInputs,
 )
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState
@@ -738,7 +737,7 @@ def test_prefill_consumes_batched_text_without_reencoding(monkeypatch: pytest.Mo
     assert model._pending_batch_rows == [0]
 
 
-def test_voice_clone_batched_encode_and_embedding_match_individual(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_voice_clone_individual_encode_and_batched_embeddings_match_individual(monkeypatch: pytest.MonkeyPatch) -> None:
     class AudioVAE(nn.Module):
         latent_dim = 2
 
@@ -754,12 +753,6 @@ def test_voice_clone_batched_encode_and_embedding_match_individual(monkeypatch: 
 
     vae = AudioVAE()
     tts = SimpleNamespace(audio_vae=vae, _encode_sample_rate=8000, patch_size=4, chunk_size=1, audio_start_token=9)
-    wavs = [([1.0, 2.0, 3.0], 8000, "right"), ([4.0, 5.0, 6.0, 7.0], 8000, "left"), ([8.0] * 5, 8000, "right")]
-    batched = _encode_raw_audio_batch(tts, wavs)
-    assert vae.batch_sizes == [2, 1]
-    for (samples, sr, mode), feat in zip(wavs, batched, strict=True):
-        torch.testing.assert_close(feat, _encode_raw_audio(tts, samples, sr, padding_mode=mode, keep_on_device=True))
-
     model = _talker(torch.device("cpu"))
     state = _state(model, 3, torch.device("cpu"), monkeypatch)
     model._pending_requests = []
@@ -796,7 +789,7 @@ def test_voice_clone_batched_encode_and_embedding_match_individual(monkeypatch: 
             info.update(prompt_audio=[[prompt_bytes, 8000]], prompt_text=["hello"])
         infos.append(info)
     model.preprocess_batch_mrv2(req_infos=infos, device=torch.device("cpu"))
-    assert vae.batch_sizes[-1] == 4
+    assert vae.batch_sizes == [1, 1, 1, 1]
     for index, info in enumerate(infos):
         cache, embeds, text_mask, audio_mask, audio_feat, feat_embed = info["prepared_prefill"]
         individual_cache = model._build_prompt_cache(
