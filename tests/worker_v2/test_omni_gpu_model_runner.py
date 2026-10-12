@@ -45,6 +45,17 @@ def test_runner_assisted_decode_rejects_undersized_or_overbudget_bucket() -> Non
         )
 
 
+def test_runner_assisted_mixed_batch_has_independent_token_and_request_capacity() -> None:
+    original = BatchExecutionDescriptor(CUDAGraphMode.NONE, 7, None)
+    request = RunnerAssistedFullAttentionMetadataRequest(4, True, 8)
+    padded = _runner_assisted_batch_descriptor(original, request, 3, 8)
+    assert padded is not None
+    assert (padded.num_reqs, padded.num_tokens, padded.cg_mode) == (4, 8, CUDAGraphMode.NONE)
+    assert original.num_tokens == 7
+    invalid = RunnerAssistedFullAttentionMetadataRequest(4, True, 3)
+    assert _runner_assisted_batch_descriptor(original, invalid, 3, 8) is None
+
+
 def _make_runner():
     """Create an OmniGPUModelRunner without calling __init__."""
     runner = object.__new__(OmniGPUModelRunner)

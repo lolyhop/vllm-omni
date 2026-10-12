@@ -10,6 +10,8 @@ from typing import NamedTuple, Protocol
 class RunnerAssistedFullAttentionMetadataRequest(NamedTuple):
     num_reqs_padded: int
     for_cudagraph_capture: bool
+    # Mixed graphs use separate token and request capacities.
+    num_tokens_padded: int | None = None
 
 
 class RunnerAssistedAttentionMetadataProvider(Protocol):

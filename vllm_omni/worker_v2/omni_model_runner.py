@@ -61,9 +61,10 @@ def _runner_assisted_batch_descriptor(
     max_num_seqs: int,
 ) -> BatchExecutionDescriptor | None:
     bucket = request.num_reqs_padded
-    if not (num_reqs <= bucket <= max_num_seqs and batch_desc.num_tokens <= bucket):
+    tokens = request.num_tokens_padded if request.num_tokens_padded is not None else bucket
+    if not (num_reqs <= bucket <= max_num_seqs and batch_desc.num_tokens <= tokens and tokens >= bucket):
         return None
-    return replace(batch_desc, num_reqs=bucket, num_tokens=bucket)
+    return replace(batch_desc, num_reqs=bucket, num_tokens=tokens)
 
 
 def _needs_capture_tensor_unwrap(model: Any) -> bool:
@@ -570,7 +571,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             and batch_desc.cg_mode == CUDAGraphMode.NONE
             and intermediate_tensors is None
             and batch_req_state is not None
-            and num_reqs > 1
+            and num_reqs > 0
         ):
             request_hook = getattr(self.model, "get_runner_assisted_full_attention_metadata_request", None)
             context_hook = getattr(self.model, "set_runner_assisted_full_attention_metadata_context", None)
@@ -599,6 +600,15 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not dummy_run:
             assert batch_req_state is not None
             input_batch = self.prepare_inputs(scheduler_output, batch_req_state, batch_desc, num_active_loras)
+            if runner_assisted_request is not None:
+                # Preserve the uniform decode bound. Mixed graphs instead
+                # need a stable varlen launch layout across packed layouts.
+                query_bound = (
+                    max_query_len
+                    if runner_assisted_request.num_tokens_padded is None
+                    else max(2, runner_assisted_request.num_tokens_padded)
+                )
+                input_batch = replace(input_batch, max_query_len=query_bound)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             if runner_assisted_request is not None and input_batch.num_reqs_after_padding > input_batch.num_reqs:
                 # prepare_pos_seq_lens only writes real rows. The graph's

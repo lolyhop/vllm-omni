@@ -392,6 +392,9 @@ class _CapturedUnifiedDecodeGraph:
     # Internal buffers for CFM solver
     cfm_buffers: _CFMBufferManager
     cfm_noise: torch.Tensor
+    text_mask: torch.Tensor | None = None
+    last_token_indices: torch.Tensor | None = None
+    scaffold_hidden: torch.Tensor | None = None
 
 
 @dataclasses.dataclass
@@ -1048,6 +1051,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             min(self._max_batch_size, self._unified_decode_graph_max_batch_size)
         )
         self._unified_graph_stats = _UnifiedDecodeGraphStats()
+        self._mixed_graphs: dict[tuple[int, int], _CapturedUnifiedDecodeGraph] = {}
         self._runner_assisted_unified_decode_graph_active = False
         self._runner_assisted_unified_decode_graph_batch_size = 0
 
@@ -1847,7 +1851,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
     # -------------------- unified decode graph --------------------
 
-    def _capture_unified_decode_graph(self, batch_size: int) -> _CapturedUnifiedDecodeGraph:
+    def _capture_unified_decode_graph(
+        self, batch_size: int, token_capacity: int | None = None
+    ) -> _CapturedUnifiedDecodeGraph:
+        mixed = token_capacity is not None
+        token_capacity = token_capacity if mixed else batch_size
         H = self.config.hidden_size
         D = self._feat_dim
         P = self._patch_size
@@ -1873,9 +1881,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         g = _CapturedUnifiedDecodeGraph(
             graph=torch.cuda.CUDAGraph(),
             batch_size=batch_size,
-            input_embeds=torch.zeros(batch_size, H, device=dev, dtype=dtype),
-            positions=torch.zeros(batch_size, device=dev, dtype=torch.long),
-            prev_feat_embed=torch.zeros(batch_size, H, device=dev, dtype=dtype),
+            input_embeds=torch.zeros(token_capacity, H, device=dev, dtype=dtype),
+            positions=torch.zeros(token_capacity, device=dev, dtype=torch.long),
+            prev_feat_embed=torch.zeros(token_capacity, H, device=dev, dtype=dtype),
             prefix_feat_cond=torch.zeros(batch_size, P, D, device=dev, dtype=dtype),
             next_feat_embed=torch.zeros(batch_size, H, device=dev, dtype=dtype),
             cfm_output=torch.zeros(batch_size, D, P, device=dev, dtype=dtype),
@@ -1884,6 +1892,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             cfm_noise=torch.zeros(batch_size, D, P, device=dev, dtype=dtype),
         )
 
+        if mixed:
+            g.text_mask = torch.ones(token_capacity, 1, device=dev, dtype=dtype)
+            g.last_token_indices = torch.zeros(batch_size, device=dev, dtype=torch.long)
         dit_proj = self._dit_proj_fn
 
         def unified_fwd():
@@ -1891,8 +1902,14 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             if isinstance(scaffold_h, tuple):
                 scaffold_h = scaffold_h[0]
             lm_h = tts.fsq_layer(scaffold_h)
+            if mixed:
+                lm_h = lm_h * (1 - g.text_mask) + scaffold_h * g.text_mask
             res_input = tts.fusion_concat_proj(torch.cat([lm_h, g.prev_feat_embed], dim=-1))
             res_h = self.residual_model(positions=g.positions, inputs_embeds=res_input)
+            if mixed:
+                g.scaffold_hidden = scaffold_h
+                lm_h = lm_h.index_select(0, g.last_token_indices)
+                res_h = res_h.index_select(0, g.last_token_indices)
             dit_h = dit_proj(lm_h, res_h)
             cond = g.prefix_feat_cond.transpose(1, 2).contiguous()
             cfm_out = _optimized_solve_euler_with_noise(
@@ -2000,14 +2017,17 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         positions: torch.Tensor,
         num_reqs: int,
         batch_context: VoxCPM2BatchSlots | None = None,
+        mixed_token_capacity: int | None = None,
     ) -> torch.Tensor:
         graph_size = self._select_unified_graph_bucket_size(num_reqs)
         if graph_size is None:
             raise RuntimeError(f"No unified decode graph bucket for batch size {num_reqs}")
-        g = self._unified_graphs.get(graph_size)
+        graph_cache = self._unified_graphs if mixed_token_capacity is None else self._mixed_graphs
+        graph_key = graph_size if mixed_token_capacity is None else (graph_size, mixed_token_capacity)
+        g = graph_cache.get(graph_key)
         if g is None:
-            g = self._capture_unified_decode_graph(graph_size)
-            self._unified_graphs[graph_size] = g
+            g = self._capture_unified_decode_graph(graph_size, mixed_token_capacity)
+            graph_cache[graph_key] = g
 
         self._unified_graph_stats.replays += 1
         if self._enable_profiling:
@@ -2021,7 +2041,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             states.append(state)
             already_stopping = state.is_stopping
             commit_patch_mask.append(not already_stopping)
-            if not already_stopping:
+            if not already_stopping and not _is_prefill:
                 state.decode_step_count += 1
                 if state.decode_step_count >= self._max_decode_steps:
                     state.is_stopping = True
@@ -2030,6 +2050,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         model_state = getattr(self, "_mrv2_model_state", None)
         if model_state is not None:
             slot_indices = model_state.indices_for(states, batch_context)
+        if mixed_token_capacity is not None:
+            self._prepare_mixed_graph_inputs(g, num_reqs)
+        elif model_state is not None:
             g.prev_feat_embed[:num_reqs].copy_(model_state.next_embed.index_select(0, slot_indices))
             g.prefix_feat_cond[:num_reqs].copy_(model_state.prefix_feat.index_select(0, slot_indices))
         else:
@@ -2042,9 +2065,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 else:
                     g.prefix_feat_cond[i].copy_(pfc.squeeze(0))
 
-        g.input_embeds[:num_reqs].copy_(inputs_embeds[:num_reqs])
-        g.positions[:num_reqs].copy_(positions[:num_reqs])
-        if graph_size > num_reqs:
+        num_tokens = sum(count for _, _, _, count in self._pending_requests) if mixed_token_capacity else num_reqs
+        g.input_embeds[:num_tokens].copy_(inputs_embeds[:num_tokens])
+        g.positions[:num_tokens].copy_(positions[:num_tokens])
+        if mixed_token_capacity is not None:
+            g.input_embeds[num_tokens:].zero_()
+            g.positions[num_tokens:].zero_()
+        elif graph_size > num_reqs:
             # Runner-assisted FULL metadata pads attention to graph_size. Keep
             # padded rows as valid duplicates instead of position-0 zero rows;
             # some attention backends may still touch padded slots before
@@ -2062,7 +2089,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         # Seeded rows overwrite their slice from their own generator, so the
         # noise a seeded request sees does not depend on batch composition.
         for i, state in enumerate(states[:num_reqs]):
-            if state.cfm_generator is not None:
+            if mixed_token_capacity is not None and self._has_deterministic_cfm_noise(state):
+                self._fill_deterministic_cfm_noise_for_state(state, g.cfm_noise[i : i + 1])
+            elif state.cfm_generator is not None:
                 g.cfm_noise[i : i + 1].normal_(generator=state.cfm_generator)
         self._perf.stop("unified.copy_inputs")
 
@@ -2117,6 +2146,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 self._commit_decode_state(state, stop_logits_i, next_embed_i, cfm_out_i)
         self._perf.stop("unified.commit")
 
+        if mixed_token_capacity is not None:
+            for state, (_, is_prefill, _, _) in zip(states, self._pending_requests, strict=True):
+                if is_prefill:
+                    state.decode_step_count = 0
+                    state.request_start_time = time.perf_counter()
+                    state.prefill_completed = True
+                    state.prefill_embeds = None
+                    state.prefill_masks = None
+                    state.prompt_cache = None
         self._perf.start("unified.audio")
         self._precompute_stop_flags_for_audio_collect(states)
         ready_audio = self._drain_ready_audio_copies_for_states(states)
@@ -2130,7 +2168,46 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._pending_requests.clear()
         self._flush_deferred_cleanup()
         self._perf.stop("unified.audio")
-        return g.next_feat_embed[:num_reqs]
+        return g.scaffold_hidden[:num_tokens] if mixed_token_capacity is not None else g.next_feat_embed[:num_reqs]
+
+    def _mixed_unified_graph_enabled(self) -> bool:
+        return (
+            self._enable_unified_decode_graph
+            and getattr(self, "_mrv2_model_state", None) is not None
+            and not getattr(getattr(self.vllm_config, "scheduler_config", None), "enable_chunked_prefill", True)
+        )
+
+    def _mixed_token_capacity(self, num_tokens: int, request_bucket: int) -> int | None:
+        limit = self.vllm_config.scheduler_config.max_num_batched_tokens
+        required = max(num_tokens, request_bucket)
+        if required > limit:
+            return None
+        return min(limit, 1 << (required - 1).bit_length())
+
+    def _prepare_mixed_graph_inputs(self, g: _CapturedUnifiedDecodeGraph, num_reqs: int) -> None:
+        """Map packed token inputs to per-request patch conditions."""
+        offset = 0
+        last_indices = []
+        g.text_mask.zero_()
+        g.prev_feat_embed.zero_()
+        g.prefix_feat_cond.zero_()
+        for row, (owner, is_prefill, _embeds, count) in enumerate(self._pending_requests):
+            state = self._pending_state(owner)
+            if is_prefill:
+                text_mask, audio_mask, audio_feat, feat_embed = state.prefill_masks
+                g.text_mask[offset : offset + count].copy_(text_mask.reshape(-1, 1))
+                g.prev_feat_embed[offset : offset + count].copy_(
+                    (audio_mask.unsqueeze(-1) * feat_embed).reshape(count, -1)
+                )
+                g.prefix_feat_cond[row].copy_(audio_feat[0, -1])
+            else:
+                g.prev_feat_embed[offset].copy_(self._state_tensor(state, "prev_feat_embed").reshape(-1))
+                g.prefix_feat_cond[row].copy_(self._state_tensor(state, "curr_prefix_feat_cond"))
+            offset += count
+            last_indices.append(offset - 1)
+        last_indices.extend([last_indices[-1]] * (g.batch_size - num_reqs))
+        host = torch.tensor(last_indices, dtype=torch.long, pin_memory=g.last_token_indices.is_cuda)
+        g.last_token_indices.copy_(host, non_blocking=True)
 
     # -------------------- vllm hooks --------------------
 
@@ -2145,6 +2222,34 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     ) -> RunnerAssistedFullAttentionMetadataRequest | None:
         if not self._enable_unified_decode_graph or not self._enable_cuda_graph:
             return None
+        if len(req_ids) != num_reqs or len(num_computed_tokens) != num_reqs:
+            return None
+        has_prefill = any(int(n) == 0 for n in num_computed_tokens) or any(
+            not getattr(self._active_states.get(req_id), "prefill_completed", False) for req_id in req_ids
+        )
+        if self._mixed_unified_graph_enabled() and has_prefill:
+            tts_compiled = (
+                getattr(self.tts.feat_decoder.estimator, "_compiled", False) if self._tts is not None else False
+            )
+            if not tts_compiled or self._cuda_graph_warmup_steps < self._cuda_graph_warmup_threshold:
+                return None
+            bucket = self._select_unified_graph_bucket_size(num_reqs)
+            if (
+                bucket is None
+                or num_reqs > self._unified_decode_graph_max_batch_size
+                or len(req_ids) != num_reqs
+                or len(num_scheduled_tokens) != num_reqs
+                or any(int(n) <= 0 for n in num_scheduled_tokens)
+            ):
+                return None
+            tokens = self._mixed_token_capacity(sum(int(n) for n in num_scheduled_tokens), bucket)
+            if tokens is None:
+                return None
+            if (bucket, tokens) not in self._mixed_graphs and len(self._mixed_graphs) >= self._max_cached_graphs:
+                return None
+            return RunnerAssistedFullAttentionMetadataRequest(
+                bucket, (bucket, tokens) not in self._mixed_graphs, tokens
+            )
         if num_reqs <= 1 or num_reqs > self._unified_decode_graph_max_batch_size:
             return None
         if num_reqs > self._max_cached_graphs or self._select_unified_graph_bucket_size(num_reqs) is None:
@@ -2216,12 +2321,34 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
 
         tts_compiled = getattr(self.tts.feat_decoder.estimator, "_compiled", False) if self._tts is not None else False
         graph_ready = tts_compiled and self._cuda_graph_warmup_steps >= self._cuda_graph_warmup_threshold
-        if num_decode > 0:
+        if num_decode > 0 or (num_reqs > 0 and self._mixed_unified_graph_enabled()):
             self._cuda_graph_warmup_steps += 1
 
         can_use_graph = (
             self._enable_cuda_graph and graph_ready and intermediate_tensors is None and inputs_embeds is not None
         )
+
+        if (
+            self._mixed_unified_graph_enabled()
+            and any(is_prefill for _, is_prefill, _, _ in self._pending_requests)
+            and self._runner_assisted_unified_decode_graph_active
+            and can_use_graph
+            and num_reqs > 0
+            and all(
+                (
+                    self._pending_state(owner).is_last_prefill_chunk
+                    if is_prefill
+                    else self._pending_state(owner).decode_state_ready
+                )
+                for owner, is_prefill, _, _ in self._pending_requests
+            )
+        ):
+            capacity = self._mixed_token_capacity(
+                sum(n for _, _, _, n in self._pending_requests), self._select_unified_graph_bucket_size(num_reqs)
+            )
+            result = self._forward_unified_decode(inputs_embeds, positions, num_reqs, batch_context, capacity)
+            self._perf.stop("forward_total")
+            return result
 
         unified_skip_reason = self._unified_decode_graph_skip_reason(
             can_use_graph=can_use_graph,
