@@ -989,3 +989,40 @@ def test_per_patch_preemption_restores_context_and_pending_api_audio(monkeypatch
     assert state.latent_context[1, :4].tolist() == [[7.0, 7.0]] * 4
     assert state.pcm_stream.requests["first"] is audio
     assert audio.push(torch.full((32,), 2.0), ended=False).tolist() == [1.0] * 32 + [2.0] * 32
+
+
+def test_prepared_reference_prefill_speaker_cache_owns_snapshot(monkeypatch):
+    from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import _PreparedPrefill
+
+    model = _talker(torch.device("cpu"))
+    model._pending_requests, model._pending_batch_rows = [], []
+    model.config.bos_token_id = 1
+    state = _state(model, 1, torch.device("cpu"), monkeypatch)
+    state.add_request(0, SimpleNamespace(req_id="first"))
+    model._get_multichar_zh_split = lambda: {}
+    cache_store = {}
+    model._speaker_cache = SimpleNamespace(
+        make_cache_key=lambda *args, **kwargs: "speaker", put=lambda key, value: cache_store.update({key: value})
+    )
+    feature = torch.ones(1, 4, 2)
+    prepared = _PreparedPrefill(
+        {"mode": "reference", "ref_audio_feat": feature},
+        torch.zeros(2, 6),
+        torch.ones(1, 2),
+        torch.zeros(1, 2),
+        torch.zeros(1, 2, 4, 2),
+        torch.zeros(1, 2, 6),
+    )
+    model.preprocess(
+        torch.ones(2, dtype=torch.long),
+        None,
+        req_id="first",
+        slot_index=0,
+        batch_row=0,
+        _omni_is_prefill=True,
+        text_token_ids=[[1, 2]],
+        voice_name="speaker",
+        prepared_prefill=prepared,
+    )
+    feature.zero_()
+    torch.testing.assert_close(cache_store["speaker"]["ref_audio_feat"], torch.ones(1, 4, 2))

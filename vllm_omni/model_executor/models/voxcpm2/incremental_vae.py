@@ -15,6 +15,8 @@ def incremental_vae_context(vae, caches, slots, valid, num_slots):
     Cache storage stays fixed across graph replays. Overrides are installed only
     while decoding/capturing; ordinary full-sequence decode remains available.
     """
+    from voxcpm.modules.audiovae.audio_vae_v2 import CausalConv1d, CausalTransposeConv1d, NoiseBlock
+
     originals = []
 
     def cached_input(name, x, history):
@@ -29,13 +31,17 @@ def incremental_vae_context(vae, caches, slots, valid, num_slots):
 
     try:
         for name, module in vae.decoder.named_modules():
-            if type(module).__name__ == "NoiseBlock":
+            if isinstance(module, NoiseBlock):
                 raise ValueError("Incremental VoxCPM2 VAE does not support stochastic NoiseBlock")
             if isinstance(module, nn.ConvTranspose1d):
-                if type(module).__name__ != "CausalTransposeConv1d":
+                if not isinstance(module, CausalTransposeConv1d):
                     raise ValueError("Incremental VoxCPM2 VAE requires causal transpose convolutions")
+                if module.dilation[0] != 1 or module.padding[0] != 0 or module.output_padding[0] != 0:
+                    raise ValueError("Incremental VoxCPM2 VAE requires unpadded, dilation-one transpose convolutions")
+                trim = module.kernel_size[0] - module.stride[0]
                 history = (module.kernel_size[0] - 1) // module.stride[0]
-                trim = module._CausalTransposeConv1d__padding * 2 - module._CausalTransposeConv1d__output_padding
+                if trim < 0:
+                    raise ValueError("Incremental VoxCPM2 VAE requires transpose kernel size >= stride")
                 if not history:
                     continue
 
@@ -47,11 +53,13 @@ def incremental_vae_context(vae, caches, slots, valid, num_slots):
                     return out[..., left:-right_trim] if right_trim else out[..., left:]
 
             elif isinstance(module, nn.Conv1d):
-                if type(module).__name__ != "CausalConv1d":
+                if not isinstance(module, CausalConv1d):
                     raise ValueError("Incremental VoxCPM2 VAE requires causal convolutions")
                 if module.stride[0] != 1:
                     raise ValueError("Incremental VoxCPM2 VAE requires stride-one decoder convolutions")
-                history = module._CausalConv1d__padding * 2 - module._CausalConv1d__output_padding
+                if module.padding[0] != 0:
+                    raise ValueError("Incremental VoxCPM2 VAE requires externally padded causal convolutions")
+                history = (module.kernel_size[0] - 1) * module.dilation[0]
                 if not history:
                     continue
 

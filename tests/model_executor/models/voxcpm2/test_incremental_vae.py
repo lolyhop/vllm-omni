@@ -6,36 +6,21 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from vllm_omni.model_executor.models.voxcpm2.incremental_vae import incremental_vae_decode
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-class CausalConv1d(nn.Conv1d):
-    def __init__(self, channels, dilation=1):
-        super().__init__(channels, channels, 3, dilation=dilation)
-        self.__padding = dilation
-        self.__output_padding = 0
-
-    def forward(self, x):
-        return super().forward(F.pad(x, (self.__padding * 2, 0)))
-
-
-class CausalTransposeConv1d(nn.ConvTranspose1d):
-    def __init__(self, channels):
-        super().__init__(channels, channels, 4, stride=2)
-        self.__padding = 1
-        self.__output_padding = 0
-
-    def forward(self, x):
-        return super().forward(x)[..., :-2]
-
-
 def _vae():
     torch.manual_seed(42)
-    decoder = nn.Sequential(CausalConv1d(2, dilation=3), nn.Tanh(), CausalTransposeConv1d(2), CausalConv1d(2))
+    native = pytest.importorskip("voxcpm.modules.audiovae.audio_vae_v2")
+    decoder = nn.Sequential(
+        native.CausalConv1d(2, 2, 3, dilation=3, padding=3),
+        nn.Tanh(),
+        native.CausalTransposeConv1d(2, 2, 4, stride=2, padding=1),
+        native.CausalConv1d(2, 2, 3, padding=1),
+    )
     return SimpleNamespace(decoder=decoder, decode=lambda x, **_: decoder(x))
 
 

@@ -356,3 +356,30 @@ def test_chunked_prefill_graph_uses_current_chunk_masks_and_conditioning():
     assert not graph.prev_feat_embed[1:].any()
     torch.testing.assert_close(graph.prefix_feat_cond[0], state.prefill_masks[2][0, 3])
     assert graph.last_token_indices.tolist() == [1]
+
+
+@pytest.mark.parametrize("missing", ["request_bucket", "token_capacity"])
+def test_mixed_invalid_capacity_falls_through_without_decode_graph(monkeypatch, missing):
+    model = _ready_metadata_model()
+    model._perf = SimpleNamespace(start=lambda *_: None)
+    model._mrv2_model_state = SimpleNamespace(per_patch_audio=True)
+    model._runner_assisted_unified_decode_graph_active = True
+    model._active_states = {"p": VoxCPM2RequestState(request_id="p")}
+    model._pending_requests = [("p", True, None, 2)]
+    if missing == "request_bucket":
+        model._select_unified_graph_bucket_size = lambda _: None
+        model._mixed_token_capacity = lambda *_: pytest.fail("capacity must not receive a missing bucket")
+    else:
+        model._mixed_token_capacity = lambda *_: None
+    model._forward_unified_decode = lambda *_: pytest.fail("invalid mixed capacity selected a decode graph")
+
+    class FallbackReachedError(Exception):
+        pass
+
+    def normal_dispatch(**kwargs):
+        assert not kwargs["is_all_decode"]
+        raise FallbackReachedError
+
+    monkeypatch.setattr(model, "_unified_decode_graph_skip_reason", normal_dispatch)
+    with pytest.raises(FallbackReachedError):
+        model.forward(torch.zeros(2, dtype=torch.long), torch.arange(2), inputs_embeds=torch.zeros(2, 4))

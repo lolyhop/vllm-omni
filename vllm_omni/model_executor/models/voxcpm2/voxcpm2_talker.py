@@ -2178,7 +2178,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 g.stop_logits[:num_reqs] if g.stop_logits is not None else self._stop_fn(g.lm_hidden[:num_reqs])
             )
         if model_state is not None and g.pcm is not None:
-            # Tensor commits run on GPU; request control flags stay on host.
+            # GPU valid/active masks own tensor commits. Host ready flags describe
+            # initialized slot data, not whether this step committed a new patch.
             for state, committed in zip(states, commit_mask, strict=True):
                 if not committed:
                     continue
@@ -2376,12 +2377,16 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 for req_id, is_prefill, _, _ in self._pending_requests
             )
         ):
-            capacity = self._mixed_token_capacity(
-                sum(n for _, _, _, n in self._pending_requests), self._select_unified_graph_bucket_size(num_reqs)
+            bucket = self._select_unified_graph_bucket_size(num_reqs)
+            capacity = (
+                self._mixed_token_capacity(sum(n for _, _, _, n in self._pending_requests), bucket)
+                if bucket is not None
+                else None
             )
-            result = self._forward_unified_decode(inputs_embeds, positions, num_reqs, batch_context, capacity)
-            self._perf.stop("forward_total")
-            return result
+            if capacity is not None:
+                result = self._forward_unified_decode(inputs_embeds, positions, num_reqs, batch_context, capacity)
+                self._perf.stop("forward_total")
+                return result
 
         unified_skip_reason = self._unified_decode_graph_skip_reason(
             can_use_graph=can_use_graph,
@@ -3893,7 +3898,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 and "ref_audio_feat" in state.prompt_cache
             ):
                 key = self._speaker_cache.make_cache_key(voice_name, model_type="voxcpm2", created_at=_created_at)
-                self._speaker_cache.put(key, {"ref_audio_feat": state.prompt_cache["ref_audio_feat"]})
+                self._speaker_cache.put(key, {"ref_audio_feat": state.prompt_cache["ref_audio_feat"].clone()})
 
             if state.prompt_cache is None and voice_name:
                 _cache_key = self._speaker_cache.make_cache_key(
@@ -3934,7 +3939,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                     self._speaker_cache.put(
                         _key,
                         {
-                            "ref_audio_feat": cached_feat
+                            "ref_audio_feat": cached_feat.clone()
                             if getattr(self, "_mrv2_model_state", None) is not None
                             else cached_feat.cpu()
                         },
