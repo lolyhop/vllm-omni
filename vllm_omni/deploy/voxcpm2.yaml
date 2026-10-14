@@ -10,10 +10,12 @@ dtype: bfloat16
 
 stages:
   - stage_id: 0
-    max_num_seqs: 8
+    # Deploy branch: 32 slots; L40 Poisson sweep kept TTFA p95 <= 160 ms up to ~10 RPS.
+    max_num_seqs: 32
     gpu_memory_utilization: 0.9
     # Right-size the KV cache instead of letting it fill gpu_memory_utilization.
-    # max_num_seqs(8) * max_model_len(4096) ~= 32k tokens; 6 GiB leaves headroom
+    # ~37 KiB/token (base + residual LM) -> 6 GiB holds ~170k tokens, enough for
+    # max_num_seqs(32) * max_model_len(4096) ~= 131k tokens; 6 GiB leaves headroom
     # for longer live requests while keeping VoxCPM2 TTS decode batches small
     # enough to avoid the high ITL observed with large admission caps.
     # The remaining VRAM stays free for the VoxCPM2 diffusion side-path
@@ -51,7 +53,7 @@ stages:
           enable_loc_dit_skip_qkv_contig: true
           enable_loc_dit_reduce_overhead_no_cg: true
           enable_unified_decode_graph: true
-          unified_decode_graph_max_batch_size: 8
+          unified_decode_graph_max_batch_size: 32
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0
