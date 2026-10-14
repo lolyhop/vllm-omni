@@ -22,7 +22,7 @@ def test_runner_specific_audio_defaults(uses_v2):
     assert config.audio_emit_every == (3 if uses_v2 else 1)
 
 
-def test_mrv2_explicit_legacy_audio_override():
+def test_mrv2_pins_incremental_audio_settings():
     config = _VoxCPM2RuntimeConfig.from_vllm_config(
         SimpleNamespace(
             model_config=SimpleNamespace(
@@ -31,9 +31,9 @@ def test_mrv2_explicit_legacy_audio_override():
             )
         )
     )
-    assert not config.enable_incremental_vae
-    assert config.vae_decode_every == 3
-    assert config.audio_emit_every == 1
+    assert config.enable_incremental_vae
+    assert config.vae_decode_every == 1
+    assert config.audio_emit_every == 3
 
 
 @dataclass
