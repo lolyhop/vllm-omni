@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _MRV2_PINNED = {"enable_incremental_vae": True, "vae_decode_every": 1, "audio_emit_every": 3}
+_MRV2_PIN_WARNED: set[tuple[str, object]] = set()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,7 +82,9 @@ class _VoxCPM2RuntimeConfig:
         if getattr(model_config, "use_v2_model_runner", False):
             # Deploy branch: MRV2 runs only the validated per-patch incremental VAE path.
             for key, value in _MRV2_PINNED.items():
-                if values.get(key, value) != value:
+                if values.get(key, value) != value and (key, values[key]) not in _MRV2_PIN_WARNED:
+                    # The scheduler rebuilds this config every step; warn once per value.
+                    _MRV2_PIN_WARNED.add((key, values[key]))
                     logger.warning("VoxCPM2 MRV2 pins %s=%r; ignoring configured %r", key, value, values[key])
                 values[key] = value
         return cls(**values)._normalized()
