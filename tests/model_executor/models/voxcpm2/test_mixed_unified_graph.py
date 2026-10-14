@@ -104,8 +104,11 @@ def test_mixed_admission_removes_only_graph_specific_restriction(monkeypatch, us
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("per_patch_audio,incremental_vae", [(False, False), (True, False), (True, True)])
-def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patch_audio, incremental_vae):
+@pytest.mark.parametrize(
+    "per_patch_audio,incremental_vae,patch_count",
+    [(False, False, None), (True, False, None), (True, True, None), (True, True, 0), (True, True, 1), (True, True, 2)],
+)
+def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patch_audio, incremental_vae, patch_count):
     """Exercise actual CUDA capture; attention is stubbed, so this is not FA2 E2E."""
     from contextlib import nullcontext
 
@@ -148,11 +151,13 @@ def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patc
     monkeypatch.setattr(module, "_CFMBufferManager", lambda **kwargs: None)
     monkeypatch.setattr(module, "get_forward_context", lambda: SimpleNamespace(attn_metadata=None))
     monkeypatch.setattr(module, "override_forward_context", lambda _: nullcontext())
-    monkeypatch.setattr(
-        module,
-        "_optimized_solve_euler_with_noise",
-        lambda decoder, mu, patch, cond, *args, **kwargs: mu[:, :2, None] + cond,
-    )
+    cfm_calls = []
+
+    def solve(decoder, mu, patch, cond, *args, **kwargs):
+        cfm_calls.append(mu.shape[0])
+        return mu[:, :2, None] + cond
+
+    monkeypatch.setattr(module, "_optimized_solve_euler_with_noise", solve)
     if per_patch_audio:
         from vllm_omni.model_executor.models.voxcpm2.model_state import VoxCPM2ModelState
 
@@ -177,7 +182,18 @@ def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patc
         model._stop_fn = lambda x: x[:, :2]
         monkeypatch.setattr(model, "_get_vae_decode_sr_cond", lambda _: None)
 
-    graph = model._capture_unified_decode_graph(4, 8)
+    graph = model._capture_unified_decode_graph(4, 8, patch_count)
+    if patch_count == 0:
+        assert not cfm_calls
+    else:
+        assert cfm_calls and all(count == (4 if patch_count is None else patch_count) for count in cfm_calls)
+    expected_valid = (
+        [False, True, False, False]
+        if patch_count == 1
+        else ([False] * 4 if patch_count == 0 else [True, True, False, False])
+    )
+    if graph.patch_indices is not None:
+        graph.patch_indices.copy_(torch.tensor([1, 0][:patch_count], device="cuda"))
     if per_patch_audio:
         assert (graph.pcm is not None) == incremental_vae
         assert not owner.latent_context_lengths.any()
@@ -216,12 +232,19 @@ def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patc
                     graph.audio_slots, graph.audio_rows_valid, graph.cfm_output.transpose(1, 2)
                 )
             assert graph.pcm.shape == (4, 6)
-            assert graph.pcm_valid.tolist() == [True, True, False, False]
+            assert graph.pcm_valid.tolist() == expected_valid
             torch.testing.assert_close(graph.stop_logits, graph.lm_hidden[:, :2])
+
+    if patch_count == 1:
+        graph.patch_indices.fill_(0)
+        graph.graph.replay()
+        assert graph.pcm_valid.tolist() == [True, False, False, False]
 
     if per_patch_audio:
         model._mrv2_model_state = owner
-        decode_graph = model._capture_unified_decode_graph(4)
+        decode_graph = model._capture_unified_decode_graph(4, patch_batch_size=patch_count)
+        if decode_graph.patch_indices is not None:
+            decode_graph.patch_indices.copy_(torch.tensor([1, 0][:patch_count], device="cuda"))
         decode_graph.audio_slots.copy_(torch.tensor([0, 1, 2, 2], device="cuda"))
         decode_graph.audio_rows_valid.copy_(torch.tensor([True, True, False, False], device="cuda"))
         decode_graph.input_embeds.fill_(1)
@@ -234,7 +257,7 @@ def test_mixed_graph_capture_replays_changed_packed_layout(monkeypatch, per_patc
                 decode_graph.audio_slots, decode_graph.audio_rows_valid, decode_graph.cfm_output.transpose(1, 2)
             )
         assert decode_graph.pcm.shape == (4, 6)
-        assert decode_graph.pcm_valid.tolist() == [True, True, False, False]
+        assert decode_graph.pcm_valid.tolist() == expected_valid
         torch.testing.assert_close(decode_graph.stop_logits, torch.full((4, 2), 12.0, device="cuda"))
 
 

@@ -18,3 +18,7 @@ stages:
           # New buckets fall back when capped; cached buckets still replay.
           # An unlimited count does not remove token/request bucket limits.
           # mixed_graph_cache_limit: 32
+          # Run CFM/VAE only for eligible patch rows; skip both when none are ready.
+          # Exact patch counts add graph variants, trading more cache memory
+          # for less padding and intermediate-prefill computation.
+          enable_exact_patch_batch: false

@@ -159,3 +159,12 @@ def test_generation_config_runs_estimator(timesteps: int, batch_size: int, cfg_v
         t_span = buffers.get_t_span(config.inference_timesteps)
         expected = noise - cfg_value * (t_span[1] - t_span[-1])
         torch.testing.assert_close(output, expected)
+
+
+def test_exact_patch_batch_requires_incremental_unified_decode():
+    with pytest.raises(ValueError, match="Exact patch batches"):
+        _VoxCPM2RuntimeConfig(enable_exact_patch_batch=True)._normalized()
+    config = _VoxCPM2RuntimeConfig(
+        enable_exact_patch_batch=True, enable_incremental_vae=True, vae_decode_every=1
+    )._normalized()
+    assert config.enable_exact_patch_batch

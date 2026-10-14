@@ -31,6 +31,7 @@ class _VoxCPM2RuntimeConfig:
     decode_graph_capture_policy: str = "all"
     enable_vae_cuda_graph: bool = False
     enable_incremental_vae: bool = False
+    enable_exact_patch_batch: bool = False
     mixed_graph_cache_limit: int = 0  # Zero means unlimited cached mixed graph buckets.
     enable_cfm_cuda_graph: bool = False
     enable_cfm_prealloc_output: bool = False
@@ -79,6 +80,10 @@ class _VoxCPM2RuntimeConfig:
 
     def _normalized(self) -> _VoxCPM2RuntimeConfig:
         cfg = self
+        if cfg.enable_exact_patch_batch and (
+            not cfg.enable_incremental_vae or cfg.vae_decode_every != 1 or not cfg.enable_unified_decode_graph
+        ):
+            raise ValueError("Exact patch batches require incremental per-patch unified graphs")
         if cfg.enable_batched_cfm and cfg.enable_cfm_cuda_graph:
             logger.warning(
                 "VoxCPM2 batched CFM and CFM CUDA Graph are mutually exclusive; "

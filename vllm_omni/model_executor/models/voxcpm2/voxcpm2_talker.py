@@ -405,6 +405,7 @@ class _CapturedUnifiedDecodeGraph:
     cfm_noise: torch.Tensor
     text_mask: torch.Tensor | None = None
     last_token_indices: torch.Tensor | None = None
+    patch_indices: torch.Tensor | None = None
     scaffold_hidden: torch.Tensor | None = None
     pcm: torch.Tensor | None = None
     pcm_valid: torch.Tensor | None = None
@@ -1060,7 +1061,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         self._mixed_graph_cache_limit = self._runtime_config.mixed_graph_cache_limit
         self._cuda_graph_warmup_steps = 0
         self._cuda_graph_warmup_threshold = 3
-        self._unified_graphs: dict[int, _CapturedUnifiedDecodeGraph] = {}
+        self._unified_graphs: dict[int | tuple[int, int], _CapturedUnifiedDecodeGraph] = {}
         self._enable_unified_decode_graph = self._runtime_config.unified_decode_graph_available(
             use_cuda_graph=use_cuda_graph
         )
@@ -1069,7 +1070,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             min(self._max_batch_size, self._unified_decode_graph_max_batch_size)
         )
         self._unified_graph_stats = _UnifiedDecodeGraphStats()
-        self._mixed_graphs: dict[tuple[int, int], _CapturedUnifiedDecodeGraph] = {}
+        self._mixed_graphs: dict[tuple[int, int] | tuple[int, int, int], _CapturedUnifiedDecodeGraph] = {}
         self._runner_assisted_unified_decode_graph_active = False
         self._runner_assisted_unified_decode_graph_batch_size = 0
 
@@ -1861,10 +1862,11 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
     # -------------------- unified decode graph --------------------
 
     def _capture_unified_decode_graph(
-        self, batch_size: int, token_capacity: int | None = None
+        self, batch_size: int, token_capacity: int | None = None, patch_batch_size: int | None = None
     ) -> _CapturedUnifiedDecodeGraph:
         mixed = token_capacity is not None
         token_capacity = token_capacity if mixed else batch_size
+        patch_count = batch_size if patch_batch_size is None else patch_batch_size
         H = self.config.hidden_size
         D = self._feat_dim
         P = self._patch_size
@@ -1884,7 +1886,7 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             feat_dim=D,
             patch_size=P,
             dit_hidden_size=dit_hidden,
-            max_batch_size=batch_size,
+            max_batch_size=max(1, patch_count),
         )
 
         g = _CapturedUnifiedDecodeGraph(
@@ -1901,11 +1903,15 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             cfm_noise=torch.zeros(batch_size, D, P, device=dev, dtype=dtype),
         )
 
+        if patch_batch_size is not None:
+            g.patch_indices = torch.zeros(patch_count, device=dev, dtype=torch.long)
         if mixed:
             g.text_mask = torch.ones(token_capacity, 1, device=dev, dtype=dtype)
             g.last_token_indices = torch.zeros(batch_size, device=dev, dtype=torch.long)
         model_state = getattr(self, "_mrv2_model_state", None)
         per_patch_audio = model_state is not None and model_state.per_patch_audio
+        if patch_batch_size is not None and (not per_patch_audio or not model_state.incremental_vae):
+            raise ValueError("Exact patch graphs require MRV2 incremental per-patch audio")
         if per_patch_audio:
             g.audio_slots = torch.full((batch_size,), len(model_state.slots), device=dev, dtype=torch.long)
             g.audio_rows_valid = torch.zeros(batch_size, device=dev, dtype=torch.bool)
@@ -1924,14 +1930,27 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 g.scaffold_hidden = scaffold_h
                 lm_h = lm_h.index_select(0, g.last_token_indices)
                 res_h = res_h.index_select(0, g.last_token_indices)
+            output_lm_h = lm_h
+            prefix_cond = g.prefix_feat_cond
+            noise = g.cfm_noise
+            if g.patch_indices is not None:
+                if patch_count == 0:
+                    g.stop_logits = self._stop_fn(output_lm_h)
+                    g.pcm = torch.zeros(batch_size, P * int(tts.audio_vae.decode_chunk_size), device=dev)
+                    g.pcm_valid = torch.zeros(batch_size, device=dev, dtype=torch.bool)
+                    return torch.zeros_like(g.next_feat_embed), torch.zeros_like(g.cfm_output), output_lm_h
+                lm_h = lm_h.index_select(0, g.patch_indices)
+                res_h = res_h.index_select(0, g.patch_indices)
+                prefix_cond = prefix_cond.index_select(0, g.patch_indices)
+                noise = noise.index_select(0, g.patch_indices)
             dit_h = dit_proj(lm_h, res_h)
-            cond = g.prefix_feat_cond.transpose(1, 2).contiguous()
+            cond = prefix_cond.transpose(1, 2).contiguous()
             cfm_out = _optimized_solve_euler_with_noise(
                 tts.feat_decoder,
                 dit_h,
                 P,
                 cond,
-                g.cfm_noise,
+                noise,
                 self._inference_timesteps,
                 self._cfg_value,
                 cfm_buffers,
@@ -1940,15 +1959,24 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             feat_enc = tts.feat_encoder(cfm_out.transpose(1, 2).unsqueeze(1)).squeeze(1)
             next_embed = tts.enc_to_lm_proj(feat_enc)
             if per_patch_audio:
-                g.stop_logits = self._stop_fn(lm_h)
+                g.stop_logits = self._stop_fn(output_lm_h)
                 if getattr(model_state, "incremental_vae", False):
-                    g.pcm, g.pcm_valid = model_state.decode_patch(
-                        g.audio_slots, g.audio_rows_valid, cfm_out.transpose(1, 2)
-                    )
-                    model_state.commit_patch(
-                        g.audio_slots, g.pcm_valid, next_embed, cfm_out.transpose(1, 2), g.stop_logits
-                    )
-            return next_embed, cfm_out, lm_h
+                    slots, rows_valid, scores = g.audio_slots, g.audio_rows_valid, g.stop_logits
+                    if g.patch_indices is not None:
+                        slots = slots.index_select(0, g.patch_indices)
+                        rows_valid = rows_valid.index_select(0, g.patch_indices)
+                        scores = scores.index_select(0, g.patch_indices)
+                    pcm, valid = model_state.decode_patch(slots, rows_valid, cfm_out.transpose(1, 2))
+                    model_state.commit_patch(slots, valid, next_embed, cfm_out.transpose(1, 2), scores)
+                    if g.patch_indices is not None:
+                        g.pcm = pcm.new_zeros(batch_size, pcm.shape[1]).index_copy_(0, g.patch_indices, pcm)
+                        g.pcm_valid = valid.new_zeros(batch_size).index_copy_(0, g.patch_indices, valid)
+                    else:
+                        g.pcm, g.pcm_valid = pcm, valid
+            if g.patch_indices is not None:
+                next_embed = next_embed.new_zeros(batch_size, H).index_copy_(0, g.patch_indices, next_embed)
+                cfm_out = cfm_out.new_zeros(batch_size, D, P).index_copy_(0, g.patch_indices, cfm_out)
+            return next_embed, cfm_out, output_lm_h
 
         ctx = get_forward_context()
         capture_context = override_forward_context(self._nullify_volatile_metadata(ctx))
@@ -1975,6 +2003,13 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             tts.feat_decoder.estimator = original_estimator
             tts.feat_encoder = original_feat_encoder
         self._unified_graph_stats.captures += 1
+        if patch_batch_size is not None:
+            logger.info(
+                "Exact patch graph captured: request_bucket=%d token_bucket=%d patch_count=%d",
+                batch_size,
+                token_capacity,
+                patch_count,
+            )
         logger.info(
             "CUDA Graph captured for unified decode (batch_size=%d, captures=%d)",
             batch_size,
@@ -2049,11 +2084,31 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
         graph_size = self._select_unified_graph_bucket_size(num_reqs)
         if graph_size is None:
             raise RuntimeError(f"No unified decode graph bucket for batch size {num_reqs}")
+        exact = getattr(getattr(self, "_runtime_config", None), "enable_exact_patch_batch", False)
+        patch_rows = (
+            [
+                i
+                for i, (req_id, is_prefill, _, _) in enumerate(self._pending_requests)
+                if patch_is_valid(self._active_states[req_id], is_prefill)
+            ]
+            if exact
+            else None
+        )
         graph_cache = self._unified_graphs if mixed_token_capacity is None else self._mixed_graphs
         graph_key = graph_size if mixed_token_capacity is None else (graph_size, mixed_token_capacity)
+        if exact:
+            graph_key = (
+                (graph_size, len(patch_rows))
+                if mixed_token_capacity is None
+                else (graph_size, mixed_token_capacity, len(patch_rows))
+            )
         g = graph_cache.get(graph_key)
         if g is None:
-            g = self._capture_unified_decode_graph(graph_size, mixed_token_capacity)
+            g = (
+                self._capture_unified_decode_graph(graph_size, mixed_token_capacity, len(patch_rows))
+                if exact
+                else self._capture_unified_decode_graph(graph_size, mixed_token_capacity)
+            )
             graph_cache[graph_key] = g
 
         self._unified_graph_stats.replays += 1
@@ -2127,6 +2182,9 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             g.audio_slots[num_reqs:].fill_(len(model_state.slots))
             host = torch.tensor(commit_mask + [False] * (graph_size - num_reqs), dtype=torch.bool, pin_memory=True)
             g.audio_rows_valid.copy_(host, non_blocking=True)
+        if g.patch_indices is not None:
+            host_rows = torch.tensor(patch_rows, dtype=torch.long, pin_memory=True)
+            g.patch_indices.copy_(host_rows, non_blocking=True)
         self._perf.start("unified.replay")
         g.graph.replay()
         self._perf.stop("unified.replay")
@@ -2278,14 +2336,16 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             tokens = self._mixed_token_capacity(sum(int(n) for n in num_scheduled_tokens), bucket)
             if tokens is None:
                 return None
+            exact = getattr(getattr(self, "_runtime_config", None), "enable_exact_patch_batch", False)
             if (
-                (bucket, tokens) not in self._mixed_graphs
+                not exact
+                and (bucket, tokens) not in self._mixed_graphs
                 and self._mixed_graph_cache_limit > 0
                 and len(self._mixed_graphs) >= self._mixed_graph_cache_limit
             ):
                 return None
             return RunnerAssistedFullAttentionMetadataRequest(
-                bucket, (bucket, tokens) not in self._mixed_graphs, tokens
+                bucket, exact or (bucket, tokens) not in self._mixed_graphs, tokens
             )
         model_state = getattr(self, "_mrv2_model_state", None)
         per_patch_single = num_reqs == 1 and getattr(model_state, "per_patch_audio", False)
@@ -2318,7 +2378,8 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
             return None
         return RunnerAssistedFullAttentionMetadataRequest(
             num_reqs_padded=bucket_size,
-            for_cudagraph_capture=bucket_size not in self._unified_graphs,
+            for_cudagraph_capture=getattr(getattr(self, "_runtime_config", None), "enable_exact_patch_batch", False)
+            or bucket_size not in self._unified_graphs,
         )
 
     def set_runner_assisted_full_attention_metadata_context(
@@ -2383,6 +2444,20 @@ class VoxCPM2TalkerForConditionalGeneration(nn.Module):
                 if bucket is not None
                 else None
             )
+            if capacity is not None and getattr(
+                getattr(self, "_runtime_config", None), "enable_exact_patch_batch", False
+            ):
+                patch_count = sum(
+                    patch_is_valid(self._active_states[req_id], is_prefill)
+                    for req_id, is_prefill, _, _ in self._pending_requests
+                )
+                key = (bucket, capacity, patch_count)
+                if (
+                    key not in self._mixed_graphs
+                    and self._mixed_graph_cache_limit > 0
+                    and len(self._mixed_graphs) >= self._mixed_graph_cache_limit
+                ):
+                    capacity = None
             if capacity is not None:
                 result = self._forward_unified_decode(inputs_embeds, positions, num_reqs, batch_context, capacity)
                 self._perf.stop("forward_total")
